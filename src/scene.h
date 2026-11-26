@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -13,8 +14,12 @@ inline constexpr Vec3 axes[] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
 inline constexpr double nearPlane = .1;
 inline constexpr double farPlane = 2000;
 inline constexpr double minViewZoom = .025;
+inline constexpr double maxViewZoom = 8;
+inline constexpr double minObjectScale = .05, maxObjectScale = 100;
+inline constexpr std::size_t maxSceneObjects = 10'000;
+inline constexpr std::size_t maxMeshVertices = 100'000, maxMeshFaces = 100'000;
 inline constexpr double halfBox = .5;
-inline constexpr double pi = 3.141592653589793;
+inline constexpr double pi = std::numbers::pi;
 
 struct Ray { Vec3 origin, direction; };
 
@@ -32,14 +37,20 @@ struct TransformKey {
     KeyInterpolation interpolation = KeyInterpolation::Linear;
 };
 
-enum class ObjectKind { Box, Omni, Spot, Sky, Plane, Sphere, Cylinder, Pyramid, Camera, Mesh, Group };
+enum class ObjectKind { Box, Omni, Spot, Sky, Plane, Sphere, Cylinder, Pyramid, Camera, Mesh, Group, Fog, Emitter,
+                        Teapot, CrystalPoint, CrystalOctahedron, CrystalStep, CrystalBrilliant };
 inline constexpr const char* objectNames[] = {"Box", "Omni", "Spot", "Sky", "Plane", "Sphere",
-                                             "Cylinder", "Pyramid", "Camera", "Mesh", "Group"};
+                                             "Cylinder", "Pyramid", "Camera", "Mesh", "Group", "Fog", "Emitter",
+                                             "Teapot", "Crystal Point", "Octahedron Crystal", "Step-Cut Crystal", "Brilliant Crystal"};
 inline constexpr ObjectKind creationKinds[] = {ObjectKind::Box, ObjectKind::Plane, ObjectKind::Sphere,
-                                               ObjectKind::Cylinder, ObjectKind::Pyramid, ObjectKind::Camera};
+                                               ObjectKind::Cylinder, ObjectKind::Pyramid, ObjectKind::Camera, ObjectKind::Teapot};
+inline constexpr ObjectKind crystalKinds[] = {ObjectKind::CrystalPoint, ObjectKind::CrystalOctahedron,
+                                              ObjectKind::CrystalStep, ObjectKind::CrystalBrilliant};
 inline bool isLight(ObjectKind kind) { return kind == ObjectKind::Omni || kind == ObjectKind::Spot || kind == ObjectKind::Sky; }
+inline bool isFog(ObjectKind kind) { return kind == ObjectKind::Fog; }
+inline bool isEmitter(ObjectKind kind) { return kind == ObjectKind::Emitter; }
 inline bool isGeometry(ObjectKind kind) {
-    return !isLight(kind) && kind != ObjectKind::Camera && kind != ObjectKind::Group;
+    return !isLight(kind) && kind != ObjectKind::Camera && kind != ObjectKind::Group && !isFog(kind) && !isEmitter(kind);
 }
 
 struct Light {
@@ -52,6 +63,61 @@ struct Light {
     bool shadows = false;
     int shadowSize = 128;
     double shadowTransparency = .15;
+};
+
+enum class FogStyle { Mist, Cloud };
+enum class FogQuality { Fast, Balanced, High };
+inline constexpr int minFogDensity = 0, maxFogDensity = 400;
+inline constexpr int minFogDetail = 1, maxFogDetail = 24;
+inline constexpr int minFogFlow = 0, maxFogFlow = 100;
+inline constexpr double fogDensityUnit = .01;
+
+struct FogVolume {
+    FogStyle style = FogStyle::Mist;
+    int density = 70;
+    int detail = 5;
+    int flow = 0;
+    Color color{.86f, .91f, 1.0f};
+    bool shadows = true;
+    FogQuality quality = FogQuality::Balanced;
+};
+
+enum class CollisionRole { Automatic, Dynamic, Static, Ignore };
+inline constexpr double minBodyMass = .01, maxBodyMass = 10'000;
+inline constexpr double maxBodyVelocity = 120;
+inline constexpr double maxDynamicsGravity = 100;
+inline constexpr double maxGroundHeight = 10'000;
+
+struct CollisionSettings {
+    CollisionRole role = CollisionRole::Automatic;
+    double mass = 1;
+    double bounce = .25;
+    double friction = .5;
+    Vec3 velocity{};
+    bool operator==(const CollisionSettings& other) const {
+        return role == other.role && mass == other.mass && bounce == other.bounce && friction == other.friction &&
+               velocity.x == other.velocity.x && velocity.y == other.velocity.y && velocity.z == other.velocity.z;
+    }
+};
+
+struct DynamicsSettings {
+    double gravity = 9.81;
+    double groundHeight = 0;
+    bool ground = true;
+    bool operator==(const DynamicsSettings&) const = default;
+};
+
+inline constexpr int minEmissionRate = 1, maxEmissionRate = 500;
+inline constexpr double minParticleRadius = .025, maxParticleRadius = .4;
+inline constexpr double maxEmissionSpeed = 25, maxParticleLifetime = 60;
+struct EmitterSettings {
+    int rate = 120;
+    double radius = .075;
+    double speed = 2;
+    double viscosity = .32;
+    double lifetime = 24;
+    FogQuality quality = FogQuality::Balanced;
+    bool operator==(const EmitterSettings&) const = default;
 };
 
 struct MeshFace {
@@ -91,6 +157,9 @@ struct Model {
     int planeSegmentsX = 1, planeSegmentsY = 1;
     MeshShading meshShading = MeshShading::Default;
     std::vector<std::array<Vec2, 4>> defaultTextureUvs{};
+    FogVolume fog{};
+    CollisionSettings collision{};
+    EmitterSettings emitter{};
 };
 
 inline bool isDescendant(const std::vector<Model>& models, int child, int group) {

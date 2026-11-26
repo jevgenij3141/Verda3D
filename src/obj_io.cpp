@@ -12,7 +12,6 @@
 #include <unordered_map>
 
 namespace {
-constexpr std::size_t maxVertices = 100000, maxFaces = 100000;
 
 bool indexOf(std::string_view text, std::size_t count, std::size_t& index) {
     long long raw = 0;
@@ -88,7 +87,7 @@ bool appendPolygon(Mesh& mesh, const std::vector<std::size_t>& vertices, const s
     }
     if (turn(projected[remaining[0]], projected[remaining[1]], projected[remaining[2]]) <= tolerance) return false;
     append(remaining[0], remaining[1], remaining[2]);
-    return mesh.faces.size() <= maxFaces;
+    return mesh.faces.size() <= maxMeshFaces;
 }
 
 std::string cleanName(std::string name, std::size_t number) {
@@ -155,11 +154,11 @@ bool importObj(const wchar_t* filename, std::vector<Model>& models, std::wstring
                 if (!(row >> p.x >> p.y >> p.z) ||
                     !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
                     std::max({std::abs(p.x), std::abs(p.y), std::abs(p.z)}) > 1e7 ||
-                    positions.size() >= maxVertices * 10) return invalid();
+                    positions.size() >= maxMeshVertices * 10) return invalid();
                 positions.push_back(p);
             } else if (type == "vt") {
                 Vec2 uv{};
-                if (!(row >> uv.x) || !std::isfinite(uv.x) || coordinates.size() >= maxVertices * 20) return invalid();
+                if (!(row >> uv.x) || !std::isfinite(uv.x) || coordinates.size() >= maxMeshVertices * 20) return invalid();
                 if (row >> uv.y && !std::isfinite(uv.y)) return invalid();
                 coordinates.push_back({uv.x, 1 - uv.y});
             } else if (type == "o" || type == "g") {
@@ -180,7 +179,7 @@ bool importObj(const wchar_t* filename, std::vector<Model>& models, std::wstring
                     if (!indexOf(fields.substr(0, slash), positions.size(), vertex)) return invalid();
                     const auto insertion = remap.emplace(vertex, object.mesh.vertices.size());
                     if (insertion.second) {
-                        if (object.mesh.vertices.size() >= maxVertices) return invalid();
+                        if (object.mesh.vertices.size() >= maxMeshVertices) return invalid();
                         object.mesh.vertices.push_back(positions[vertex]);
                     }
                     indices.push_back(insertion.first->second);
@@ -196,7 +195,7 @@ bool importObj(const wchar_t* filename, std::vector<Model>& models, std::wstring
                     }
                     uv.push_back(texel);
                 }
-                if (indices.size() < 3 || object.mesh.faces.size() + indices.size() - 2 > maxFaces ||
+                if (indices.size() < 3 || object.mesh.faces.size() + indices.size() - 2 > maxMeshFaces ||
                     !appendPolygon(object.mesh, indices, uv)) return invalid();
             }
         }

@@ -3,6 +3,8 @@
 #include <commdlg.h>
 #include <GL/gl.h>
 
+#include "dynamics.h"
+#include "fluid.h"
 #include "global_renderer.h"
 #include "graphics_api.h"
 #include "image_output.h"
@@ -23,6 +25,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,14 +49,20 @@ constexpr Color heading{.89f, .92f, .97f};
 constexpr Color muted{.56f, .62f, .71f};
 constexpr Color accent{.43f, .76f, 1.0f};
 constexpr Color meshAccent{1.0f, .54f, .20f};
+constexpr Color fogAccent{.68f, .82f, .92f};
 constexpr int toolbarWidth = 56;
 constexpr int sidebarWidth = 218;
-constexpr int headerHeight = 49;
+constexpr int headerHeight = 36;
 constexpr int statusHeight = 32;
 constexpr int materialGridTop = 38, materialTileWidth = 98, materialTileHeight = 85;
 constexpr int timelineHeight = 91;
 constexpr int modelRowHeight = 32;
 constexpr int modelListTop = 94;
+constexpr int fogControlsTop = 65, fogControlSpacing = 27, fogControlHeight = 23;
+constexpr int fogQualityRow = 5, fogShadowsRow = 6;
+constexpr std::array fogQualityNames{"Fast", "Balanced", "High"};
+constexpr std::array fogQualityMenuNames{L"Fast", L"Balanced", L"High"};
+constexpr int fogPropertiesHeight = fogControlsTop + fogControlSpacing * fogShadowsRow + fogControlHeight + 12;
 constexpr LONG minWindowWidth = 660, minWindowHeight = 540;
 constexpr Color lightAccent{1.0f, .79f, .39f};
 constexpr int bitmapSizes[] = {64, 128, 256};
@@ -75,6 +84,24 @@ void line(Vec2 a, Vec2 b, Color c, float width = 1) {
     vertex(b);
     glEnd();
     glLineWidth(1);
+}
+
+void drawCheckbox(Rect row, bool checked) {
+    fill({row.x, row.y + 3, 15, 15}, {.22f, .27f, .35f});
+    if (!checked) return;
+    const Vec2 origin{double(row.x), double(row.y)};
+    line(origin + Vec2{3, 9}, origin + Vec2{6, 13}, accent, 2);
+    line(origin + Vec2{6, 13}, origin + Vec2{12, 6}, accent, 2);
+}
+
+void diamond(Vec2 p, double radius, Color tint) {
+    color(tint);
+    glBegin(GL_TRIANGLE_FAN);
+    vertex(p + Vec2{-radius, 0});
+    vertex(p + Vec2{0, -radius});
+    vertex(p + Vec2{radius, 0});
+    vertex(p + Vec2{0, radius});
+    glEnd();
 }
 
 void arrow(Vec2 start, Vec2 tip, Color c, double head, float width) {
@@ -219,12 +246,12 @@ struct PlaneHandle {
     bool visible = false;
 };
 constexpr double cross2(Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; }
-enum class Tool { Move, Scale, Rotate, Extrude, Bridge };
+enum class Tool { Move, Scale, Rotate, Extrude, Bridge, Select };
 bool selectsFaces(Tool tool) { return tool == Tool::Extrude || tool == Tool::Bridge; }
-enum class DragKind { Transform, Pan, Orbit, Extrude, Component };
+enum class DragKind { Transform, Pan, Orbit, Extrude, Component, Marquee };
 enum class ComponentMode { Vertex, Edge, Polygon };
 constexpr const char* componentNames[] = {"Vertex", "Edge", "Polygon"};
-constexpr const char* toolNames[] = {"Move", "Scale", "Rotate", "Extrude"};
+constexpr const char* toolNames[] = {"Move", "Scale", "Rotate", "Extrude", "Bridge Faces", "Select"};
 constexpr UINT moveCommand = 201;
 constexpr UINT scaleCommand = 202;
 constexpr UINT rotateCommand = 203;
@@ -248,9 +275,16 @@ constexpr UINT convertMeshCommand = 231, shadeSmoothCommand = 232, shadeFlatComm
 constexpr UINT configureGraphicsCommand = 234;
 constexpr UINT bridgeCommand = 235;
 constexpr UINT materialWindowCommand = 236;
+constexpr UINT selectCommand = 237;
 constexpr UINT cancelRenderMessage = WM_APP + 1;
 constexpr UINT_PTR renderTimer = 10;
+constexpr UINT renderPreviewIntervalMs = 80;
+constexpr std::size_t undoHistoryLimit = 32;
+constexpr std::size_t undoMeshBudgetBytes = 64 * 1024 * 1024;
 constexpr UINT_PTR timelineTimer = 11;
+constexpr UINT_PTR dynamicsTimer = 12;
+constexpr UINT dynamicsTimerIntervalMs = 16;
+constexpr int dynamicsMenuRowHeight = 33;
 constexpr int ringSegments = 64;
 
 struct Material {
@@ -308,7 +342,43 @@ struct RenderFrame {
     int width = 0, height = 0;
     std::vector<unsigned char> pixels;
     std::wstring status;
+    int progress = -1;
+    bool complete = true;
+    std::size_t completedPixels = 0;
 };
+
+bool copyRenderPreview(RenderFrame& frame, RenderJob& job) {
+    std::vector<unsigned char> thumbnail;
+    std::vector<RenderTile> tiles;
+    int step = 0;
+    {
+        std::lock_guard<std::mutex> lock(job.preview->mutex);
+        step = job.preview->thumbnailStep;
+        thumbnail.swap(job.preview->thumbnail);
+        tiles = job.preview->completedTiles;
+        job.preview->completedTiles.clear();
+    }
+    if (thumbnail.empty() && tiles.empty()) return false;
+    if (frame.pixels.empty()) frame.pixels.resize(std::size_t(frame.width) * frame.height * 4);
+    if (!thumbnail.empty()) {
+        const int thumbnailWidth = (frame.width + step - 1) / step;
+        for (int y = 0; y < frame.height; ++y) {
+            const auto* source = thumbnail.data() + std::size_t(y / step) * thumbnailWidth * 4;
+            auto* destination = frame.pixels.data() + std::size_t(y) * frame.width * 4;
+            for (int x = 0; x < frame.width; ++x)
+                std::copy_n(source + (x / step) * 4, 4, destination + x * 4);
+        }
+    }
+    for (const auto& tile : tiles) {
+        for (int y = tile.y; y < tile.y + tile.height; ++y) {
+            const auto offset = (std::size_t(y) * frame.width + tile.x) * 4;
+            std::copy_n(job.pixels.data() + offset, tile.width * 4, frame.pixels.data() + offset);
+        }
+        frame.completedPixels += std::size_t(tile.width) * tile.height;
+    }
+    frame.progress = std::min(99, int(frame.completedPixels * 100 / (std::size_t(frame.width) * frame.height)));
+    return true;
+}
 
 LRESULT CALLBACK renderWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == WM_NCCREATE) {
@@ -318,27 +388,39 @@ LRESULT CALLBACK renderWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
     const auto* snapshot = reinterpret_cast<const RenderFrame*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_INITMENUPOPUP && snapshot) {
         const HMENU menu = reinterpret_cast<HMENU>(wParam);
-        EnableMenuItem(menu, savePngCommand, MF_BYCOMMAND | (snapshot->pixels.empty() ? MF_GRAYED : MF_ENABLED));
+        const bool canSave = snapshot->complete && !snapshot->pixels.empty();
+        EnableMenuItem(menu, savePngCommand, MF_BYCOMMAND | (canSave ? MF_ENABLED : MF_GRAYED));
         return 0;
     }
     if ((message == WM_COMMAND && LOWORD(wParam) == savePngCommand) ||
         (message == WM_KEYDOWN && wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000))) {
-        if (snapshot && !snapshot->pixels.empty() &&
+        if (snapshot && snapshot->complete && !snapshot->pixels.empty() &&
             !saveRenderPng(window, snapshot->width, snapshot->height, snapshot->pixels)) {
             MessageBoxW(window, L"Could not write the PNG file.", L"Save Render", MB_OK | MB_ICONERROR);
         }
         return 0;
     }
     if (message == WM_PAINT) {
-        const auto& frame = *reinterpret_cast<const RenderFrame*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         PAINTSTRUCT paint{};
         const HDC dc = BeginPaint(window, &paint);
         RECT area{};
         GetClientRect(window, &area);
-        FillRect(dc, &area, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        const auto background = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        if (!snapshot) {
+            FillRect(dc, &area, background);
+            EndPaint(window, &paint);
+            return 0;
+        }
+        const auto& frame = *snapshot;
+        const LONG bottom = area.bottom;
+        if (frame.progress >= 0) area.bottom = std::max(0L, bottom - 24);
         if (!frame.pixels.empty()) {
             const double scale = std::min(double(area.right) / frame.width, double(area.bottom) / frame.height);
             const int w = int(frame.width * scale), h = int(frame.height * scale);
+            const int x = (area.right - w) / 2, y = (area.bottom - h) / 2;
+            for (const RECT margin : {RECT{0, 0, area.right, y}, RECT{0, y + h, area.right, area.bottom},
+                                      RECT{0, y, x, y + h}, RECT{x + w, y, area.right, y + h}})
+                FillRect(dc, &margin, background);
             BITMAPINFO bitmap{};
             bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             bitmap.bmiHeader.biWidth = frame.width;
@@ -346,13 +428,34 @@ LRESULT CALLBACK renderWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             bitmap.bmiHeader.biPlanes = 1;
             bitmap.bmiHeader.biBitCount = 32;
             SetStretchBltMode(dc, HALFTONE);
-            StretchDIBits(dc, (area.right - w) / 2, (area.bottom - h) / 2, w, h, 0, 0,
-                          frame.width, frame.height, frame.pixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
-        } else if (!frame.status.empty()) {
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(220, 231, 246));
-            SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-            DrawTextW(dc, frame.status.c_str(), -1, &area, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            StretchDIBits(dc, x, y, w, h, 0, 0, frame.width, frame.height, frame.pixels.data(),
+                          &bitmap, DIB_RGB_COLORS, SRCCOPY);
+        } else {
+            FillRect(dc, &area, background);
+            if (!frame.status.empty()) {
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, RGB(220, 231, 246));
+                SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+                DrawTextW(dc, frame.status.c_str(), -1, &area, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        if (frame.progress >= 0) {
+            const RECT footer{0, area.bottom, area.right, bottom};
+            FillRect(dc, &footer, background);
+            if (area.right > 62) {
+                const RECT track{12, area.bottom + 11, area.right - 48, area.bottom + 14};
+                FillRect(dc, &track, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+                const RECT filled{track.left, track.top,
+                                  track.left + (track.right - track.left) * frame.progress / 100, track.bottom};
+                SetDCBrushColor(dc, RGB(224, 54, 64));
+                FillRect(dc, &filled, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, RGB(212, 216, 222));
+                SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+                RECT percent{track.right + 4, area.bottom, area.right - 10, bottom};
+                const auto label = std::to_wstring(frame.progress) + L"%";
+                DrawTextW(dc, label.c_str(), -1, &percent, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
         }
         EndPaint(window, &paint);
         return 0;
@@ -391,9 +494,11 @@ private:
         std::array<View, 4> views;
         RenderSettings rendering;
         TimelineSettings animation;
+        DynamicsSettings dynamics;
         int selected, activeView;
         std::uint64_t revision;
         std::vector<int> selection;
+        std::vector<std::size_t> faceSelection;
     };
     std::vector<SceneState> undoHistory, redoHistory;
     std::optional<SceneState> interactionBefore;
@@ -406,6 +511,18 @@ private:
     int materialWidth = 0, materialHeight = 0, materialFirstRow = 0;
     int materialWheelDelta = 0;
     TimelineSettings timeline;
+    DynamicsSettings dynamicsSettings;
+    struct DynamicsPreview {
+        DynamicsSimulation simulation;
+        FluidSimulation fluid;
+        std::vector<std::pair<std::size_t, Vec3>> original;
+        std::size_t modelCount, materialCount;
+        ULONGLONG lastTick = 0;
+        ULONGLONG lastSurface = 0;
+        int waterMaterial = -1;
+        bool playing = false;
+    };
+    std::optional<DynamicsPreview> dynamics;
     KeyInterpolation newKeyInterpolation = KeyInterpolation::Linear;
     bool scrubbingTimeline = false;
     bool playing = false;
@@ -418,18 +535,27 @@ private:
     int modifierListOffset = 0;
     int activeView = 0;
     int listOffset = 0;
-    enum class Flyout { None, Creation, Lighting, Transform, Modeling };
+    enum class Flyout { None, Creation, Crystals, Lighting, Transform, Modeling, Effects, Dynamics };
     Flyout flyout = Flyout::None;
     Tool tool = Tool::Move;
     std::vector<std::size_t> selectedFaces;
+    struct MeshEditChange {
+        ComponentMode mode;
+        std::vector<std::size_t> components;
+        std::vector<std::pair<std::size_t, Vec3>> positions;
+        std::optional<Mesh> topology;
+        ObjectKind kind = ObjectKind::Mesh;
+        std::vector<std::array<Vec2, 4>> defaultUvs;
+    };
     struct MeshEdit {
         Model draft;
         ComponentMode mode;
         Tool tool = Tool::Move;
         std::vector<std::array<std::size_t, 2>> edges;
-        std::array<std::size_t, 4> indices{};
-        std::array<Vec3, 4> original{};
-        std::size_t count = 0;
+        std::vector<std::size_t> components;
+        std::vector<std::size_t> vertices;
+        std::vector<Vec3> original;
+        std::vector<MeshEditChange> undoHistory, redoHistory;
         double unitsPerPixel = 0;
     };
     std::optional<MeshEdit> meshEdit;
@@ -440,6 +566,7 @@ private:
     std::thread renderWorker;
     std::unique_ptr<VideoPanel> videoPanel;
     bool renderJobGlobal = false;
+    bool renderJobFog = false;
     std::vector<ShadowMap> shadowMaps;
     bool shadowMapsDirty = true;
     ULONGLONG lastShadowUpdate = 0;
@@ -480,6 +607,8 @@ private:
         int initialCamera = -1;
         Vec2 tangent{};
         Vec3 componentPivot{};
+        Vec2 marqueeEnd{};
+        bool additiveMarquee = false;
     } drag;
 
     void layout(int w, int h);
@@ -506,11 +635,20 @@ private:
     Rect lightingButton() const { return {10, 108, 36, 36}; }
     Rect transformButton() const { return {10, 154, 36, 36}; }
     Rect modelingButton() const { return {10, 200, 36, 36}; }
-    Rect boxMenu() const { return {56, 62, 150, 36 * int(std::size(creationKinds))}; }
+    Rect boxMenu() const { return {56, 62, 150, 36 * (int(std::size(creationKinds)) + 1)}; }
+    Rect crystalMenu() const {
+        const auto box = boxMenu();
+        return {box.x + box.w, box.y + box.h - 36, 194, 36 * int(std::size(crystalKinds))};
+    }
     Rect lightingMenu() const { return {56, 108, 142, 108}; }
     Rect transformMenu() const { return {56, 154, 142, 108}; }
     Rect modelingMenu() const { return {56, 200, 170, 108}; }
-    Rect fullscreenButton() const { return {width - 149, 10, 136, 29}; }
+    Rect selectButton() const { return {139, 6, 76, 24}; }
+    Rect effectsButton() const { return {230, 6, 83, 24}; }
+    Rect effectsMenu() const { return {effectsButton().x, headerHeight, 130, 36}; }
+    Rect dynamicsButton() const { return {328, 6, 103, 24}; }
+    Rect dynamicsMenu() const { return {dynamicsButton().x, headerHeight, 183, dynamicsMenuRowHeight * 7}; }
+    Rect fullscreenButton() const { return {width - 149, 6, 136, 24}; }
     Rect resizeGrip() const { return {width - 24, height - 24, 24, 24}; }
     int timelineWidth() const { return width - sidebarWidth; }
     int timelineTop() const { return height - statusHeight - timelineHeight; }
@@ -533,14 +671,26 @@ private:
     }
     bool lightSelected() const { return selected >= 0 && isLight(models[selected].kind); }
     bool cameraSelected() const { return selected >= 0 && models[selected].kind == ObjectKind::Camera; }
+    bool fogSelected() const { return selected >= 0 && isFog(models[selected].kind); }
+    bool emitterSelected() const { return selected >= 0 && isEmitter(models[selected].kind); }
     bool geometrySelected() const { return selected >= 0 && isGeometry(models[selected].kind); }
     bool canRotateSelected() const { return selected >= 0 && objectVisible(models, selected) && models[selected].kind != ObjectKind::Omni; }
     Rect properties() const {
-        const int h = selected < 0 ? 0 : lightSelected() ? 202 : geometrySelected()
+        const int h = selected < 0 ? 0 : lightSelected() ? 202 : fogSelected() ? fogPropertiesHeight :
+            emitterSelected() ? 106 : geometrySelected()
             ? std::clamp(height - statusHeight - modelListTop - 53, 208, 279) : 69;
         return {width - sidebarWidth, height - statusHeight - h, sidebarWidth, h};
     }
     Rect lightSetupButton() const { const Rect r = properties(); return {r.x + 14, r.y + 33, 100, 24}; }
+    Rect emitterSettingsButton() const { const Rect r = properties(); return {r.x + 14, r.y + 69, r.w - 28, 24}; }
+    Rect fogOption(int row) const {
+        const Rect r = properties();
+        return {r.x + 104, r.y + fogControlsTop + row * fogControlSpacing, 97, fogControlHeight};
+    }
+    Rect fogShadowsButton() const {
+        const Rect r = properties();
+        return {r.x + 14, fogOption(fogShadowsRow).y, r.w - 28, fogControlHeight};
+    }
     Rect inspectButton() const { const Rect r = properties(); return {r.x + 120, r.y + (geometrySelected() ? 6 : 33), 83, 24}; }
     Rect componentButton(int i) const { const Rect r = properties(); return {r.x + 14 + i * 30, r.y + 34, 26, 23}; }
     Rect planeSegmentsButton(int i) const { const Rect r = properties(); return {r.x + 110 + i * 48, r.y + 34, 45, 23}; }
@@ -584,13 +734,22 @@ private:
     void startPlayback();
     void stopPlayback();
     void tickPlayback();
+    void configureDynamics();
+    DynamicsSimulation createDynamicsSimulation() const;
+    void toggleDynamics();
+    void resetDynamics();
+    void tickDynamics();
+    void bakeDynamics();
+    void addEmitter(bool withDish);
+    void configureEmitter();
+    void keepWaterSurface();
     void materialMenu(POINT screen);
     void toggleFullscreen();
     void setTool(Tool value);
     Tool activeTool() const { return meshEdit ? meshEdit->tool : tool; }
     bool toolAvailable(Tool value) const {
-        return !meshEdit || value == Tool::Move ||
-            ((value == Tool::Rotate || value == Tool::Scale) && meshEdit->mode != ComponentMode::Vertex);
+        return !meshEdit || value == Tool::Select || value == Tool::Move || value == Tool::Rotate || value == Tool::Scale ||
+            (value == Tool::Extrude && meshEdit->mode == ComponentMode::Polygon);
     }
     void updateTransformMenu() const;
     void renderActiveView();
@@ -633,6 +792,8 @@ private:
     void startInteraction();
     void commitInteraction();
     void undo(bool redo);
+    void recordMeshChange(MeshEditChange change);
+    void undoMeshChange(bool redo);
     void duplicate();
     void deleteSelection();
     void groupSelection();
@@ -651,8 +812,9 @@ private:
     void frameSelection();
     void sceneMenu(POINT screen, int row);
     void addLight(ObjectKind kind);
+    void addFog();
     void select(int model, bool toggle = false);
-    void mouseDown(Vec2 p, bool orbit, bool toggle = false);
+    void mouseDown(Vec2 p, bool orbit, bool toggle = false, bool marquee = false);
     void mouseMove(Vec2 p);
     void beginExtrusion(int view, Vec2 point, Vec3 direction, bool axisDrag = false);
     void updateExtrusion(Vec2 delta);
@@ -662,7 +824,14 @@ private:
     void finishMeshEdit(bool commit);
     void convertToMesh();
     void setMeshShading(MeshShading mode);
-    void beginComponentDrag(int view, Vec2 point, bool handlesOnly = false);
+    void beginComponentDrag(int view, Vec2 point, bool handlesOnly = false, bool toggle = false);
+    void beginMarquee(int view, Vec2 point, bool additive);
+    Rect marqueeBounds() const;
+    void finishMarquee();
+    void refreshComponentVertices();
+    void pickExtrusionFace(int view, Vec2 point, std::size_t face, bool toggle);
+    const Model& extrusionModel() const { return meshEdit ? meshEdit->draft : models[selected]; }
+    const std::vector<std::size_t>& extrusionFaces() const { return meshEdit ? meshEdit->components : selectedFaces; }
     Vec3 componentCenter() const;
     void drawComponentMarkers(const View& view);
     void panStart(Vec2 p);
@@ -699,6 +868,7 @@ bool Editor::init(HWND hwnd) {
 }
 
 void Editor::release() {
+    resetDynamics();
     if (materialWindow) DestroyWindow(materialWindow);
     videoPanel.reset();
     stopPlayback();
@@ -858,7 +1028,7 @@ void drawSurface(const View& view, const Model& model, const Surface& surface,
     const bool glossy = surface.specular > 0 &&
         (surface.shading == Shading::Phong || surface.shading == Shading::BlinnPhong);
     if (highlight && !glossy) return;
-    const bool perturbed = preset == MaterialPreset::Ocean || preset == MaterialPreset::Ice;
+    const bool perturbed = usesSurfaceRipples(preset);
     const bool lit = !lights.empty() && surface.shading != Shading::Unlit;
     const int divisions = perturbed || lit ? 24 : glossy && view.perspective && (highlight || opacity < 1) ? 12 : 1;
     const Vec3 eye = view.eye();
@@ -1053,11 +1223,11 @@ void Editor::drawModels(const View& view) {
         glBegin(GL_POINTS);
         for (Vec3 local : edit.draft.mesh.vertices) point(local);
         glEnd();
-        if (edit.count) {
+        if (!edit.vertices.empty()) {
             glPointSize(7);
             color(heading);
             glBegin(GL_POINTS);
-            point(edit.draft.mesh.vertices[edit.indices[0]]);
+            for (const auto index : edit.vertices) point(edit.draft.mesh.vertices[index]);
             glEnd();
         }
         glPointSize(1);
@@ -1114,9 +1284,12 @@ void Editor::drawView(const View& view) {
 
 std::array<Handle, 3> Editor::handles(const View& view) const {
     std::array<Handle, 3> result{};
-    if (selected < 0 || !objectVisible(models, selected) || activeTool() == Tool::Bridge) return result;
-    if (meshEdit ? meshEdit->count == 0 || activeTool() == Tool::Rotate : (tool == Tool::Extrude && selectedFaces.empty()) ||
-        (tool == Tool::Scale && !geometrySelected() && models[selected].kind != ObjectKind::Group)) return result;
+    if (selected < 0 || !objectVisible(models, selected) || activeTool() == Tool::Bridge ||
+        activeTool() == Tool::Select) return result;
+    if (meshEdit ? meshEdit->vertices.empty() || activeTool() == Tool::Rotate ||
+        (activeTool() == Tool::Scale && meshEdit->vertices.size() < 2) : (tool == Tool::Extrude && selectedFaces.empty()) ||
+        (tool == Tool::Scale && !geometrySelected() && !fogSelected() && !emitterSelected() &&
+         models[selected].kind != ObjectKind::Group)) return result;
     const Transform& transform = models[selected].transform;
     const Vec3 position = meshEdit ? componentCenter() : tool == Tool::Extrude ? extrusionCenter() : transform.position;
     const double depth = view.depth(position);
@@ -1135,14 +1308,19 @@ std::array<Handle, 3> Editor::handles(const View& view) const {
 }
 
 Vec3 Editor::extrusionCenter() const {
-    Vec3 center{};
-    for (auto index : selectedFaces) {
-        const auto face = faceGeometry(models[selected], index, true);
-        const auto corners = face.corners();
-        for (std::size_t i = 0; i < face.count(); ++i)
-            center = center + corners[i] * (1.0 / face.count());
+    const auto& model = models[selected];
+    const auto& mesh = modelMesh(model, true);
+    std::vector<std::size_t> vertices;
+    vertices.reserve(selectedFaces.size() * 4);
+    for (const auto index : selectedFaces) {
+        const auto& face = mesh.faces[index];
+        vertices.insert(vertices.end(), face.vertices.begin(), face.vertices.begin() + face.count);
     }
-    return center * (1.0 / selectedFaces.size());
+    std::sort(vertices.begin(), vertices.end());
+    vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
+    Vec3 center{};
+    for (const auto index : vertices) center = center + mesh.vertices[index];
+    return model.transform.position + worldVector(model.transform, center * (1.0 / vertices.size()));
 }
 
 Vec2 projectedAxis(const View& view, Vec3 pivot, Vec3 axis) {
@@ -1157,8 +1335,10 @@ std::array<PlaneHandle, 3> Editor::planeHandles(const View& view) const {
     std::array<PlaneHandle, 3> result{};
     if (selected < 0 || !objectVisible(models, selected)) return result;
     const Tool current = activeTool();
-    if ((current != Tool::Move && current != Tool::Scale) || (meshEdit && meshEdit->count == 0) ||
-        (current == Tool::Scale && !geometrySelected() && models[selected].kind != ObjectKind::Group)) return result;
+    if ((current != Tool::Move && current != Tool::Scale) ||
+        (meshEdit && meshEdit->vertices.size() < (current == Tool::Scale ? 2u : 1u)) ||
+        (current == Tool::Scale && !geometrySelected() && !fogSelected() && !emitterSelected() &&
+         models[selected].kind != ObjectKind::Group)) return result;
     const Vec3 pivot = meshEdit ? componentCenter() : models[selected].transform.position;
     const double depth = view.depth(pivot);
     if (depth <= nearPlane || depth >= farPlane) return result;
@@ -1267,7 +1447,7 @@ std::array<Vec2, ringSegments + 1> Editor::rotationRing(const View& view, int ax
 }
 
 int Editor::pickRotationRing(const View& view, Vec2 point, Vec2& tangent) const {
-    if (!canRotateSelected() || (meshEdit && meshEdit->count < 2)) return -1;
+    if (!canRotateSelected() || (meshEdit && meshEdit->vertices.size() < 2)) return -1;
     const Vec3 pivot = meshEdit ? componentCenter() : models[selected].transform.position;
     if (view.depth(pivot) <= nearPlane * 2) return -1;
     const Vec2 fromCenter = point - view.project(pivot);
@@ -1373,11 +1553,28 @@ void Editor::drawViewOverlay(const View& view) {
         fill({r.x + r.w - 1, r.y, 1, r.h}, accent);
     }
     drawTransformHandles(view);
+    if (drag.kind == DragKind::Marquee && drag.view >= 0 && &view == &views[drag.view]) {
+        const auto box = marqueeBounds();
+        if (std::max(box.w, box.h) >= 5) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glColor4f(accent.r, accent.g, accent.b, .18f);
+            glRecti(box.x, box.y, box.x + box.w, box.y + box.h);
+            glDisable(GL_BLEND);
+            color(accent);
+            const double left = box.x, right = box.x + box.w;
+            const double top = box.y, bottom = box.y + box.h;
+            glBegin(GL_LINE_LOOP);
+            vertex(Vec2{left, top}); vertex(Vec2{right, top});
+            vertex(Vec2{right, bottom}); vertex(Vec2{left, bottom});
+            glEnd();
+        }
+    }
 }
 
 void Editor::drawTransformHandles(const View& view) {
     if (activeTool() == Tool::Rotate) {
-        if (!canRotateSelected() || (meshEdit && meshEdit->count < 2)) return;
+        if (!canRotateSelected() || (meshEdit && meshEdit->vertices.size() < 2)) return;
         const Vec3 pivot = meshEdit ? componentCenter() : models[selected].transform.position;
         if (view.depth(pivot) <= nearPlane * 2) return;
         glLineWidth(2);
@@ -1426,6 +1623,29 @@ void Editor::drawLightMarkers(const View& view) {
         const Transform& transform = model.transform;
         const Vec3 position = transform.position;
         if (view.depth(position) <= nearPlane) continue;
+        if (isEmitter(model.kind)) {
+            const auto center = view.project(position);
+            diamond(center, 7, fogAccent);
+            guide(position, position - transform.basis[1] * .65, fogAccent);
+            label(int(center.x + 10), int(center.y - 4), "Emitter", fogAccent);
+            continue;
+        }
+        if (isFog(model.kind)) {
+            std::array<Vec3, 8> corners{};
+            for (std::size_t corner = 0; corner < corners.size(); ++corner) {
+                const Vec3 local{(corner & 1) ? halfBox : -halfBox, (corner & 2) ? halfBox : -halfBox,
+                                 (corner & 4) ? halfBox : -halfBox};
+                corners[corner] = position + worldVector(transform, local);
+            }
+            const Color tint = i == selected ? fogAccent : Color{.31f, .43f, .52f};
+            for (std::size_t corner = 0; corner < corners.size(); ++corner) {
+                for (std::size_t axis = 1; axis < corners.size(); axis *= 2)
+                    if (!(corner & axis)) guide(corners[corner], corners[corner | axis], tint);
+            }
+            const auto center = view.project(position);
+            label(int(center.x + 7), int(center.y - 5), "Fog", tint);
+            continue;
+        }
         const Vec2 screen = view.project(position);
         const Color tint = model.kind == ObjectKind::Camera ? (i == selected ? accent : muted) :
             i == selected ? lightAccent : model.light.enabled ? Color{.82f, .72f, .48f} : muted;
@@ -1467,12 +1687,34 @@ void Editor::drawInterface() {
     fill({0, headerHeight - 1, width, 1}, border);
     fill({toolbarWidth - 1, headerHeight, 1, height - headerHeight}, border);
     fill({sidebar, headerHeight, 1, height - headerHeight}, border);
-    boxIcon(16, 14, accent);
+    boxIcon(16, 8, accent);
     static const std::string brand = narrowUtf8(editorName);
-    label(46, 30, brand);
+    label(46, 23, brand);
+    const Rect cursor = selectButton();
+    const bool selecting = activeTool() == Tool::Select;
+    fill(cursor, selecting ? Color{.18f, .32f, .47f} : Color{.14f, .19f, .25f});
+    const Color cursorColor = selecting ? accent : heading;
+    line({149, 12}, {149, 23}, cursorColor);
+    line({149, 12}, {157, 19}, cursorColor);
+    line({149, 23}, {152, 19}, cursorColor);
+    line({152, 19}, {157, 19}, cursorColor);
+    label(cursor.x + 24, cursor.y + 17, "Select", cursorColor);
+    fill({222, 8, 1, 20}, border);
+    const Rect effects = effectsButton();
+    fill(effects, flyout == Flyout::Effects ? Color{.18f, .32f, .47f} : Color{.14f, .19f, .25f});
+    label(effects.x + 9, effects.y + 17, "Effects", heading);
+    line({double(effects.x + 64), effects.y + 10.0}, {double(effects.x + 68), effects.y + 14.0}, muted);
+    line({double(effects.x + 68), effects.y + 14.0}, {double(effects.x + 72), effects.y + 10.0}, muted);
+    const Rect dynamicsControl = dynamicsButton();
+    const bool dynamicsActive = flyout == Flyout::Dynamics || dynamics.has_value();
+    fill(dynamicsControl, dynamicsActive ? Color{.18f, .32f, .47f} : Color{.14f, .19f, .25f});
+    label(dynamicsControl.x + 9, dynamicsControl.y + 17, "Dynamics", meshEdit ? muted : heading);
+    const Vec2 chevron{double(dynamicsControl.x + dynamicsControl.w - 13), dynamicsControl.y + 12.0};
+    line(chevron + Vec2{-4, -2}, chevron + Vec2{0, 2}, muted);
+    line(chevron + Vec2{0, 2}, chevron + Vec2{4, -2}, muted);
     const Rect screen = fullscreenButton();
     fill(screen, {.14f, .19f, .25f});
-    label(screen.x + 12, screen.y + 19, fullscreen ? "Exit full screen" : "Full screen (F11)");
+    label(screen.x + 12, screen.y + 17, fullscreen ? "Exit full screen" : "Full screen (F11)");
     label(sidebar + 15, 77, "Scene");
     fill({sidebar + 12, 86, sidebarWidth - 24, 1}, border);
 
@@ -1523,7 +1765,7 @@ void Editor::drawInterface() {
                 const Vec2 c = center + (model.expanded ? Vec2{4, -2} : Vec2{-2, 4});
                 line(a, b, icon, 2);
                 line(b, c, icon, 2);
-            } else if (isGeometry(model.kind)) boxIcon(x + 3, y + 4, icon);
+            } else if (isGeometry(model.kind) || isFog(model.kind)) boxIcon(x + 3, y + 4, isFog(model.kind) ? fogAccent : icon);
             else if (model.kind == ObjectKind::Camera)
                 cameraIcon({double(x + 13), double(y + 14)}, icon);
             else lightIcon({double(x + 12), double(y + 14)}, model.kind, lightAccent, 6);
@@ -1538,7 +1780,9 @@ void Editor::drawInterface() {
     fill({0, height - statusHeight, width, statusHeight}, panel);
     fill({0, height - statusHeight, width, 1}, border);
     const int statusY = height - 11;
-    if (meshEdit) {
+    if (dynamics) {
+        label(14, statusY, dynamics->playing ? "Dynamics  |  Playing" : "Dynamics  |  Paused", accent);
+    } else if (meshEdit) {
         label(14, statusY, std::string(componentNames[int(meshEdit->mode)]) + "  |  " +
               toolNames[int(activeTool())] + "  |  Enter to apply  |  Esc to cancel  |  Alt + left drag to orbit", meshAccent);
     } else if (tool == Tool::Bridge) {
@@ -1575,7 +1819,7 @@ void Editor::drawInterface() {
             line(corner - Vec2{length, 0}, corner - Vec2{0, length}, muted);
     }
 
-    if (flyout == Flyout::Creation) {
+    if (flyout == Flyout::Creation || flyout == Flyout::Crystals) {
         const Rect menu = boxMenu();
         fill({menu.x - 1, menu.y - 1, menu.w + 2, menu.h + 2}, border);
         fill(menu, {.15f, .20f, .27f});
@@ -1585,6 +1829,18 @@ void Editor::drawInterface() {
             if (kind == ObjectKind::Camera) cameraIcon({double(menu.x + 21), double(y + 18)}, accent);
             else boxIcon(menu.x + 11, y + 9, accent);
             label(menu.x + 41, y + 24, objectNames[int(kind)]);
+        }
+        const int crystalsY = menu.y + 36 * int(std::size(creationKinds));
+        label(menu.x + 41, crystalsY + 24, "Crystals  >");
+    }
+    if (flyout == Flyout::Crystals) {
+        const auto menu = crystalMenu();
+        fill({menu.x - 1, menu.y - 1, menu.w + 2, menu.h + 2}, border);
+        fill(menu, {.15f, .20f, .27f});
+        for (std::size_t i = 0; i < std::size(crystalKinds); ++i) {
+            const int y = menu.y + 36 * int(i);
+            diamond({menu.x + 20.0, y + 18.0}, 9, fogAccent);
+            label(menu.x + 40, y + 24, objectNames[int(crystalKinds[i])]);
         }
     }
     if (flyout == Flyout::Transform) {
@@ -1608,14 +1864,33 @@ void Editor::drawInterface() {
             label(menu.x + 41, y + 23, objectNames[i + 1]);
         }
     }
+    if (flyout == Flyout::Effects) {
+        const Rect menu = effectsMenu();
+        fill({menu.x - 1, menu.y - 1, menu.w + 2, menu.h + 2}, border);
+        fill(menu, {.15f, .20f, .27f});
+        boxIcon(menu.x + 11, menu.y + 8, fogAccent);
+        label(menu.x + 42, menu.y + 24, "Fog");
+    }
+    if (flyout == Flyout::Dynamics) {
+        const Rect menu = dynamicsMenu();
+        fill({menu.x - 1, menu.y - 1, menu.w + 2, menu.h + 2}, border);
+        fill(menu, {.15f, .20f, .27f});
+        const std::array labels{"Collision...", dynamics && dynamics->playing ? "Pause" : "Play", "Reset",
+                                "Bake to Timeline...", "Water Emitter", "Water into Dish", "Keep Water Surface"};
+        for (std::size_t i = 0; i < labels.size(); ++i)
+            label(menu.x + 12, menu.y + 22 + int(i) * dynamicsMenuRowHeight, labels[i],
+                  i == 2 && !dynamics ? muted : heading);
+    }
     if (flyout == Flyout::Modeling) {
         const Rect menu = modelingMenu();
         fill({menu.x - 1, menu.y - 1, menu.w + 2, menu.h + 2}, border);
         fill(menu, {.15f, .20f, .27f});
         modelingIcon({double(menu.x + 21), double(menu.y + 18)}, meshAccent);
-        label(menu.x + 42, menu.y + 24, "Extrude", tool == Tool::Extrude ? meshAccent : heading);
-        label(menu.x + 42, menu.y + 58, "Cut (Difference)", canCut() ? heading : muted);
-        label(menu.x + 42, menu.y + 94, "Bridge Faces", tool == Tool::Bridge ? meshAccent : heading);
+        label(menu.x + 42, menu.y + 24, "Extrude",
+              activeTool() == Tool::Extrude ? meshAccent : toolAvailable(Tool::Extrude) ? heading : muted);
+        label(menu.x + 42, menu.y + 58, "Cut (Difference)", !meshEdit && canCut() ? heading : muted);
+        label(menu.x + 42, menu.y + 94, "Bridge Faces",
+              activeTool() == Tool::Bridge ? meshAccent : meshEdit ? muted : heading);
     }
 }
 
@@ -1663,6 +1938,31 @@ void Editor::drawProperties() {
         fill(setup, {.155f, .198f, .25f});
         label(setup.x + 7, setup.y + 16, "Camera view");
     }
+    if (emitterSelected()) {
+        const auto button = emitterSettingsButton();
+        fill(button, {.155f, .198f, .25f});
+        label(button.x + 7, button.y + 16, "Emitter settings...");
+        return;
+    }
+    if (fogSelected()) {
+        const auto& fog = model.fog;
+        const std::array<std::string, 6> values{fog.style == FogStyle::Mist ? "Mist" : "Cloud",
+            std::to_string(fog.density) + "%", std::to_string(fog.detail), std::to_string(fog.flow) + "%", "Color...",
+            fogQualityNames[std::size_t(fog.quality)]};
+        constexpr std::array names{"Type", "Density", "Noise scale", "Flow", "Tint", "Quality"};
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const Rect button = fogOption(int(i));
+            label(r.x + 14, button.y + 16, names[i]);
+            fill(button, {.155f, .198f, .25f});
+            label(button.x + 7, button.y + 16, values[i]);
+        }
+        const Rect tint = fogOption(4);
+        fill({tint.x + tint.w - 23, tint.y + 4, 17, 15}, fog.color);
+        const Rect shadows = fogShadowsButton();
+        drawCheckbox(shadows, fog.shadows);
+        label(shadows.x + 23, shadows.y + 15, "Shadows");
+        return;
+    }
     if (!lightSelected()) return;
 
     const Rect colorButton = lightColorButton();
@@ -1680,11 +1980,7 @@ void Editor::drawProperties() {
     std::snprintf(power, sizeof(power), "%.5g", model.light.power);
     label(intensity.x + 9, intensity.y + 16, power);
     const Rect toggle = shadowsButton();
-    fill({toggle.x, toggle.y + 3, 15, 15}, {.22f, .27f, .35f});
-    if (model.light.shadows) {
-        line({double(toggle.x + 3), double(toggle.y + 9)}, {double(toggle.x + 6), double(toggle.y + 13)}, accent, 2);
-        line({double(toggle.x + 6), double(toggle.y + 13)}, {double(toggle.x + 12), double(toggle.y + 6)}, accent, 2);
-    }
+    drawCheckbox(toggle, model.light.shadows);
     label(toggle.x + 23, toggle.y + 15, "Shadows");
     const Color controls = model.light.shadows ? heading : muted;
     label(r.x + 14, r.y + 134, "Bitmap", controls);
@@ -1750,16 +2046,6 @@ void Editor::drawModifiers() {
 
 namespace {
 constexpr Color keyColor{1.f, .72f, .31f};
-
-void diamond(Vec2 p, double radius, Color tint) {
-    color(tint);
-    glBegin(GL_TRIANGLE_FAN);
-    vertex(p + Vec2{-radius, 0});
-    vertex(p + Vec2{0, -radius});
-    vertex(p + Vec2{radius, 0});
-    vertex(p + Vec2{0, radius});
-    glEnd();
-}
 
 void transportIcon(int index, Vec2 p, Color tint) {
     if (index == 3) {
@@ -1910,9 +2196,17 @@ bool Editor::paintMaterials() {
         fill(tile, assigned ? accent : Color{.21f, .25f, .31f});
         fill({tile.x + 1, tile.y + 1, tile.w - 2, tile.h - 2}, {.13f, .16f, .21f});
         const Vec2 center{tile.center().x, double(tile.y + 27)};
-        drawMaterialSphere(*materials[i], center, false);
+        const bool crystal = isCrystalPreset(materials[i]->edit.preset);
+        if (crystal) {
+            for (const auto& facet : crystalPreview(materials[i]->edit)) {
+                color(facet.color);
+                glBegin(GL_POLYGON);
+                for (std::size_t j = 0; j < facet.count; ++j) vertex(center + facet.corners[j] * 46);
+                glEnd();
+            }
+        } else drawMaterialSphere(*materials[i], center, false);
         const Surface& surface = materials[i]->edit.surface;
-        if (surface.specular > 0 && (surface.shading == Shading::Phong || surface.shading == Shading::BlinnPhong)) {
+        if (!crystal && surface.specular > 0 && (surface.shading == Shading::Phong || surface.shading == Shading::BlinnPhong)) {
             glEnable(GL_BLEND);
             glBlendFunc(GL_ONE, GL_ONE);
             drawMaterialSphere(*materials[i], center, true);
@@ -1929,7 +2223,7 @@ bool Editor::paintMaterials() {
 
 void Editor::paint() {
     if (!context || !width || !height) return;
-    updateShadowMaps(drag.view >= 0 || playing);
+    updateShadowMaps(drag.view >= 0 || playing || (dynamics && dynamics->playing));
     syncCameras();
     glClearColor(.065f, .074f, .1f, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -2150,6 +2444,7 @@ void Editor::scrubTo(Vec2 point) {
 }
 
 void Editor::seekFrame(int frame, bool refreshPose) {
+    resetDynamics();
     frame = std::clamp(frame, 0, timeline.frames - 1);
     if (timeline.frame == frame && !refreshPose) return;
     timeline.frame = frame;
@@ -2199,6 +2494,7 @@ void Editor::chooseKeyInterpolation() {
 }
 
 void Editor::setKey(bool remove) {
+    resetDynamics();
     stopPlayback();
     endDrag();
     if (selected < 0 || models[selected].kind == ObjectKind::Group) return;
@@ -2219,6 +2515,7 @@ void Editor::setKey(bool remove) {
 
 void Editor::startPlayback() {
     if (playing) return;
+    resetDynamics();
     endDrag();
     if (timeline.frames < 2) return;
     if (timeline.frame == timeline.frames - 1) seekFrame(0, true);
@@ -2242,6 +2539,199 @@ void Editor::tickPlayback() {
     const int frame = playbackFrame(playbackStartFrame, timeline.fps, GetTickCount64() - playbackStart, last);
     seekFrame(frame);
     if (frame == last) stopPlayback();
+}
+
+void Editor::configureDynamics() {
+    resetDynamics();
+    auto settings = dynamicsSettings;
+    auto body = geometrySelected() ? models[selected].collision : CollisionSettings{};
+    const bool hasSelection = geometrySelected();
+    if (hasSelection && body.role == CollisionRole::Automatic) body.role = CollisionRole::Dynamic;
+    if (!editCollision(window, hasSelection ? &body : nullptr, settings)) return;
+    const auto applies = [&](int index) { return hasSelection && isGeometry(models[index].kind); };
+    const bool bodiesChanged = std::ranges::any_of(selection, [&](int index) {
+        return applies(index) && body != models[index].collision;
+    });
+    if (!bodiesChanged && settings == dynamicsSettings) return;
+    remember();
+    dynamicsSettings = settings;
+    for (const int index : selection)
+        if (applies(index)) models[index].collision = body;
+    repaint();
+}
+
+DynamicsSimulation Editor::createDynamicsSimulation() const {
+    bool hasDynamic = false;
+    for (int i = 0; i < int(models.size()) && !hasDynamic; ++i)
+        hasDynamic = isGeometry(models[i].kind) && models[i].collision.role == CollisionRole::Dynamic &&
+                     objectVisible(models, i);
+    return DynamicsSimulation(models, dynamicsSettings, hasDynamic ? std::span<const int>{} : std::span<const int>{selection});
+}
+
+void Editor::toggleDynamics() {
+    stopPlayback();
+    if (dynamics && dynamics->playing) {
+        KillTimer(window, dynamicsTimer);
+        dynamics->playing = false;
+    } else {
+        if (!dynamics) {
+            auto simulation = createDynamicsSimulation();
+            FluidSimulation fluid(models, dynamicsSettings);
+            if (!simulation.hasBodies() && !fluid.active()) {
+                MessageBoxW(window, L"Select a mesh, mark it as Dynamic, or add an emitter.",
+                            L"Dynamics", MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+            std::vector<std::pair<std::size_t, Vec3>> original;
+            for (const auto index : simulation.movingModels())
+                original.emplace_back(index, models[index].transform.position);
+            dynamics = DynamicsPreview{std::move(simulation), std::move(fluid), std::move(original),
+                                       models.size(), materials.size()};
+        }
+        dynamics->lastTick = GetTickCount64();
+        dynamics->playing = SetTimer(window, dynamicsTimer, dynamicsTimerIntervalMs, nullptr) != 0;
+        if (!dynamics->playing)
+            MessageBoxW(window, L"Could not start the dynamics timer.", L"Dynamics", MB_OK | MB_ICONERROR);
+    }
+    repaint();
+}
+
+void Editor::resetDynamics() {
+    if (!dynamics) return;
+    KillTimer(window, dynamicsTimer);
+    for (const auto& [index, position] : dynamics->original) models[index].transform.position = position;
+    models.resize(dynamics->modelCount);
+    materials.resize(dynamics->materialCount);
+    dynamics.reset();
+    refreshMaterials();
+    shadowMapsDirty = true;
+    repaint();
+}
+
+void Editor::tickDynamics() {
+    if (!dynamics || !dynamics->playing) return;
+    constexpr double maxRealtimeAdvance = .1;
+    const auto now = GetTickCount64();
+    const double elapsed = std::min(maxRealtimeAdvance, double(now - dynamics->lastTick) / 1000);
+    dynamics->lastTick = now;
+    dynamics->simulation.advance(elapsed);
+    dynamics->simulation.apply(models);
+    if (dynamics->fluid.active()) {
+        dynamics->fluid.advance(elapsed, models);
+        constexpr ULONGLONG surfaceIntervalMs = 85;
+        if (now - dynamics->lastSurface >= surfaceIntervalMs) {
+            dynamics->lastSurface = now;
+            auto mesh = dynamics->fluid.surface();
+            if (mesh.faces.empty()) models.resize(dynamics->modelCount);
+            else {
+                if (models.size() == dynamics->modelCount) {
+                    if (dynamics->waterMaterial < 0) {
+                        for (std::size_t i = 0; i < materials.size(); ++i) {
+                            if (materials[i]->edit.preset != MaterialPreset::ClearWater) continue;
+                            dynamics->waterMaterial = int(i);
+                            break;
+                        }
+                        if (dynamics->waterMaterial < 0 && materials.size() < 256) {
+                            auto water = std::make_shared<Material>(Color{1, 1, 1});
+                            water->edit = makePreset(MaterialPreset::ClearWater);
+                            dynamics->waterMaterial = int(materials.size());
+                            materials.push_back(std::move(water));
+                        }
+                    }
+                    Model water;
+                    water.kind = ObjectKind::Mesh;
+                    water.name = "Water preview";
+                    water.material = dynamics->waterMaterial;
+                    models.push_back(std::move(water));
+                }
+                models.back().mesh = std::move(mesh);
+            }
+        }
+    }
+    shadowMapsDirty = true;
+    repaint();
+}
+
+void Editor::addEmitter(bool withDish) {
+    resetDynamics();
+    if (models.size() + (withDish ? 2 : 1) > maxSceneObjects) return;
+    remember();
+    if (withDish) {
+        Model dish;
+        dish.kind = ObjectKind::Mesh;
+        dish.name = "Water Dish";
+        dish.mesh = createWaterDish();
+        dish.collision.role = CollisionRole::Static;
+        dish.meshShading = MeshShading::Smooth;
+        rebuildModifiers(dish);
+        models.push_back(std::move(dish));
+    }
+    Model source;
+    source.kind = ObjectKind::Emitter;
+    source.name = "Water Emitter";
+    source.transform.position = {0, 2.8, 0};
+    source.transform.size = {.26, .25, .26};
+    models.push_back(std::move(source));
+    select(int(models.size()) - 1);
+    setTool(Tool::Move);
+    shadowMapsDirty = true;
+}
+
+void Editor::configureEmitter() {
+    if (!emitterSelected()) return;
+    auto settings = models[selected].emitter;
+    if (!editWaterEmitter(window, settings) || settings == models[selected].emitter) return;
+    remember();
+    models[selected].emitter = settings;
+    repaint();
+}
+
+void Editor::keepWaterSurface() {
+    if (!dynamics || models.size() <= dynamics->modelCount) return;
+    Model water = std::move(models.back());
+    const auto material = water.material >= int(dynamics->materialCount) ? materials[water.material] : MaterialSlot{};
+    resetDynamics();
+    if (models.size() >= maxSceneObjects) return;
+    remember();
+    if (material) materials.push_back(material);
+    water.name = "Water Surface";
+    water.meshShading = MeshShading::Smooth;
+    water.collision.role = CollisionRole::Ignore;
+    rebuildModifiers(water);
+    models.push_back(std::move(water));
+    select(int(models.size()) - 1);
+    refreshMaterials();
+    repaint();
+}
+
+void Editor::bakeDynamics() {
+    resetDynamics();
+    stopPlayback();
+    auto simulation = createDynamicsSimulation();
+    if (!simulation.hasBodies()) {
+        MessageBoxW(window, L"Select a visible mesh or set its Collision role to Dynamic.",
+                    L"Dynamics", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const int first = timeline.frame;
+    constexpr std::size_t maxBakedKeys = 100'000;
+    constexpr int suggestedSeconds = 5;
+    const int maxFrames = int(maxBakedKeys / simulation.movingModels().size());
+    const int lastLimit = std::min(timeline.frames - 1, first + maxFrames - 1);
+    if (lastLimit <= first) {
+        MessageBoxW(window, L"Move the playhead earlier or increase the timeline length.",
+                    L"Bake Dynamics", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    int last = std::min(lastLimit, first + timeline.fps * suggestedSeconds);
+    if (!editWholeNumber(window, L"Bake Dynamics", L"Last frame", last, first + 1, lastLimit)) return;
+    remember();
+    for (int frame = first; frame <= last; ++frame) {
+        if (frame != first) simulation.advance(1.0 / timeline.fps);
+        simulation.apply(models);
+        for (const auto index : simulation.movingModels()) storeKey(models[index], frame);
+    }
+    seekFrame(first, true);
 }
 
 bool uploadTexture(const TextureImage& image, GLuint& texture) {
@@ -2409,6 +2899,13 @@ bool renderRasterFrame(const View& view, const std::vector<Model>& models,
     return true;
 }
 
+bool hasVisibleFog(const std::vector<Model>& models) {
+    for (int i = 0; i < int(models.size()); ++i) {
+        if (isFog(models[i].kind) && models[i].fog.density > 0 && objectVisible(models, i)) return true;
+    }
+    return false;
+}
+
 bool Editor::verifyRasterInitialization() {
     layout(760, 540);
     MaterialEdit material{Surface{{.75f, .8f, .9f}}, {}};
@@ -2440,18 +2937,38 @@ struct VideoScene {
     RenderSettings settings;
     std::vector<Model> models;
     TraceScene trace;
-    std::vector<std::size_t> geometry, lights;
+    std::vector<std::size_t> geometry, lights, volumes;
     BitmapOpenGL raster;
     std::vector<MaterialSlot> rasterMaterials;
     std::vector<ShadowMap> shadowMaps;
     bool rasterReady = false;
+    int timelineFps;
+    DynamicsSettings dynamics;
+    std::optional<FluidSimulation> waterFlow;
+    int waterMaterial = -1;
+    bool waterAttached = false;
 
-    VideoScene(View viewport, VideoSettings output, RenderSettings rendering)
-        : view(viewport), video(std::move(output)), settings(rendering) {}
+    VideoScene(View viewport, VideoSettings output, RenderSettings rendering, int fps, DynamicsSettings dynamics)
+        : view(viewport), video(std::move(output)), settings(rendering), timelineFps(fps), dynamics(dynamics) {}
 
     bool drawFrame(int frame, RenderJob& output, std::wstring& error) {
+        if (waterAttached) models.pop_back();
+        waterAttached = false;
         for (auto& model : models) {
             if (!model.keys.empty()) model.transform = evaluatePose(model, frame);
+        }
+        if (!waterFlow) waterFlow.emplace(models, dynamics);
+        if (waterFlow->active()) {
+            waterFlow->advance(1.0 / timelineFps, models);
+            auto mesh = waterFlow->surface();
+            if (!mesh.faces.empty()) {
+                Model water;
+                water.kind = ObjectKind::Mesh;
+                water.material = waterMaterial;
+                water.mesh = std::move(mesh);
+                models.push_back(std::move(water));
+                waterAttached = true;
+            }
         }
         View camera = view;
         const int cameraIndex = video.camera >= 0 ? video.camera : camera.camera;
@@ -2469,26 +2986,32 @@ struct VideoScene {
         else camera = renderView(camera, video.width, video.height);
         if (settings.mode == RenderMode::Software) {
             if (!drawRaster(camera, output, error)) return false;
-            if (!settings.caustics) return true;
+            if (!settings.caustics && !hasVisibleFog(models)) return true;
         }
         if (output.cancel.load(std::memory_order_relaxed)) return false;
 
         trace.camera = {camera.eye(), camera.right, camera.up, camera.back, camera.focal(),
                         camera.orthoScale(), camera.perspective};
+        trace.timeSeconds = double(frame) / timelineFps;
         if (trace.width == 0) {
             trace.width = video.width;
             trace.height = video.height;
             trace.samples = settings.samples;
             trace.causticPhotons = settings.caustics ? settings.causticPhotons : 0;
-            for (std::size_t i = 0; i < models.size(); ++i) {
+            const auto sceneModels = models.size() - (waterAttached ? 1 : 0);
+            for (std::size_t i = 0; i < sceneModels; ++i) {
                 const Model& model = models[i];
                 if (!objectVisible(models, int(i))) continue;
                 if (isGeometry(model.kind)) { geometry.push_back(i); trace.boxes.push_back(model); }
                 else if (isLight(model.kind)) { lights.push_back(i); trace.lights.push_back(model); }
+                else if (isFog(model.kind)) { volumes.push_back(i); trace.volumes.push_back(model); }
             }
         }
         for (std::size_t i = 0; i < geometry.size(); ++i) trace.boxes[i].transform = models[geometry[i]].transform;
         for (std::size_t i = 0; i < lights.size(); ++i) trace.lights[i].transform = models[lights[i]].transform;
+        for (std::size_t i = 0; i < volumes.size(); ++i) trace.volumes[i].transform = models[volumes[i]].transform;
+        trace.boxes.resize(geometry.size());
+        if (waterAttached) trace.boxes.push_back(models.back());
         renderGlobal(trace, output);
         if (output.failed) error = L"Could not render frame " + std::to_wstring(frame) + L".";
         return !output.failed && !output.cancel.load(std::memory_order_relaxed);
@@ -2531,9 +3054,24 @@ VideoFrameRenderer Editor::takeVideoSnapshot(const VideoSettings& settings) cons
     if (settings.camera >= 0 && (settings.camera >= int(models.size()) ||
         models[settings.camera].kind != ObjectKind::Camera ||
         widenUtf8(models[settings.camera].name) != settings.cameraName)) return {};
-    auto snapshot = std::make_shared<VideoScene>(views[activeView], settings, renderSettings);
+    auto snapshot = std::make_shared<VideoScene>(views[activeView], settings, renderSettings, timeline.fps, dynamicsSettings);
     snapshot->models = models;
-    for (const auto& material : materials) snapshot->trace.materials.push_back(material->edit);
+    if (dynamics) {
+        snapshot->models.resize(dynamics->modelCount);
+        for (const auto& [index, position] : dynamics->original)
+            snapshot->models[index].transform.position = position;
+    }
+    const auto materialCount = dynamics ? dynamics->materialCount : materials.size();
+    for (std::size_t i = 0; i < materialCount; ++i) {
+        snapshot->trace.materials.push_back(materials[i]->edit);
+        if (snapshot->waterMaterial < 0 && materials[i]->edit.preset == MaterialPreset::ClearWater)
+            snapshot->waterMaterial = int(i);
+    }
+    if (snapshot->waterMaterial < 0 &&
+        std::ranges::any_of(snapshot->models, [](const Model& model) { return isEmitter(model.kind); })) {
+        snapshot->waterMaterial = int(snapshot->trace.materials.size());
+        snapshot->trace.materials.push_back(makePreset(MaterialPreset::ClearWater));
+    }
     return [snapshot = std::move(snapshot)](int frame, RenderJob& output, std::wstring& error) {
         return snapshot->drawFrame(frame, output, error);
     };
@@ -2571,6 +3109,8 @@ void Editor::addLibraryMaterial() {
 
 void Editor::openMaterial(int index) {
     if (drag.view >= 0) return;
+    resetDynamics();
+    if (index >= int(materials.size())) return;
     stopPlayback();
     const Material& material = *materials[index];
     MaterialEdit result;
@@ -2596,6 +3136,8 @@ void Editor::materialMenu(POINT screen) {
     ScreenToClient(materialWindow, &client);
     const int index = materialAt({double(client.x), double(client.y)});
     if (index < 0) return;
+    resetDynamics();
+    if (index >= int(materials.size())) return;
 
     stopPlayback();
     flyout = Flyout::None;
@@ -2644,6 +3186,11 @@ void Editor::toggleFullscreen() {
 void Editor::setTool(Tool value) {
     if (!toolAvailable(value)) return;
     endDrag();
+    if (!meshEdit && tool == Tool::Extrude && (value <= Tool::Rotate || value == Tool::Select) &&
+        !selectedFaces.empty()) {
+        startMeshEdit(ComponentMode::Polygon);
+        tool = value;
+    }
     if (meshEdit) meshEdit->tool = value;
     else {
         tool = value;
@@ -2658,7 +3205,7 @@ void Editor::updateTransformMenu() const {
     const HMENU editMenu = GetSubMenu(GetMenu(window), 1);
     if (editMenu) {
         const Tool current = activeTool();
-        if (selectsFaces(current)) {
+        if (selectsFaces(current) || current == Tool::Select) {
             for (UINT id = moveCommand; id <= rotateCommand; ++id) CheckMenuItem(editMenu, id, MF_UNCHECKED);
         } else {
             CheckMenuRadioItem(editMenu, moveCommand, rotateCommand, moveCommand + int(current), MF_BYCOMMAND);
@@ -2669,6 +3216,7 @@ void Editor::updateTransformMenu() const {
         EnableMenuItem(editMenu, extrudeCommand, MF_BYCOMMAND | (toolAvailable(Tool::Extrude) ? MF_ENABLED : MF_GRAYED));
         CheckMenuItem(editMenu, extrudeCommand, current == Tool::Extrude ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(editMenu, bridgeCommand, current == Tool::Bridge ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(editMenu, selectCommand, current == Tool::Select ? MF_CHECKED : MF_UNCHECKED);
         EnableMenuItem(editMenu, bridgeCommand, MF_BYCOMMAND | (!meshEdit ? MF_ENABLED : MF_GRAYED));
     }
 }
@@ -2698,7 +3246,7 @@ void Editor::renderActiveView() {
         MessageBoxW(window, L"The graphics backend could not render this view.", L"Rendering", MB_OK | MB_ICONERROR);
         return;
     }
-    if (renderSettings.caustics) {
+    if (renderSettings.caustics || hasVisibleFog(models)) {
         startRayRender(view, std::move(frame));
         return;
     }
@@ -2749,24 +3297,30 @@ void Editor::startRayRender(View view, RenderFrame raster) {
     scene.height = view.rect.h;
     scene.samples = renderSettings.samples;
     scene.causticPhotons = renderSettings.caustics ? renderSettings.causticPhotons : 0;
+    scene.timeSeconds = double(timeline.frame) / timeline.fps;
     for (int i = 0; i < int(models.size()); ++i) {
         const Model& model = models[i];
         if (!objectVisible(models, i)) continue;
         if (isGeometry(model.kind)) scene.boxes.push_back(model);
         else if (isLight(model.kind)) scene.lights.push_back(model);
+        else if (isFog(model.kind) && model.fog.density > 0) scene.volumes.push_back(model);
     }
     for (const auto& material : materials) scene.materials.push_back(material->edit);
+    renderJobFog = !scene.volumes.empty();
     renderFrame = {scene.width, scene.height, {},
-                   scene.causticPhotons > 0 ? L"Tracing caustic photons..." : L"Rendering Global Illumination... 0%"};
+                   renderJobGlobal ? L"Preparing Global Illumination..."
+                                   : scene.causticPhotons > 0 ? L"Tracing caustic photons..." : L"Rendering fog...",
+                   renderJobGlobal ? 0 : -1, false};
     showRenderWindow(view, renderJobGlobal);
     if (!renderWindow) return;
     try {
         renderJob = std::make_shared<RenderJob>();
         renderJob->pixels = std::move(raster.pixels);
+        if (renderJobGlobal) renderJob->preview = std::make_unique<RenderPreview>();
         renderWorker = std::thread([snapshot = std::move(scene), job = renderJob] {
             renderGlobal(snapshot, *job);
         });
-        if (!SetTimer(window, renderTimer, 80, nullptr)) {
+        if (!SetTimer(window, renderTimer, renderPreviewIntervalMs, nullptr)) {
             stopRender();
             renderFrame.status = L"Could not track the render.";
         }
@@ -2780,15 +3334,29 @@ void Editor::startRayRender(View view, RenderFrame raster) {
 void Editor::pollRender() {
     if (!renderJob) return;
     if (renderJob->done.load(std::memory_order_acquire)) {
-        if (renderJob->failed) renderFrame.status = L"The render could not finish.";
-        else renderFrame.pixels = std::move(renderJob->pixels);
+        if (renderJob->failed) {
+            renderFrame.status = L"The render could not finish.";
+            renderFrame.pixels.clear();
+        } else {
+            renderFrame.pixels = std::move(renderJob->pixels);
+            renderFrame.complete = true;
+            if (renderJobGlobal) renderFrame.progress = 100;
+        }
         stopRender();
+    } else if (renderJobGlobal) {
+        try {
+            if (!copyRenderPreview(renderFrame, *renderJob)) return;
+        } catch (...) {
+            stopRender();
+            renderFrame.pixels.clear();
+            renderFrame.status = L"Could not display the render preview.";
+        }
     } else if (renderJob->tracingPhotons.load(std::memory_order_relaxed)) {
         renderFrame.status = L"Tracing caustic photons...";
     } else {
         const int progress = 100 * renderJob->rows.load(std::memory_order_relaxed) / renderFrame.height;
-        renderFrame.status = (renderJobGlobal ? L"Rendering Global Illumination... " : L"Applying caustics... ") +
-                             std::to_wstring(progress) + L"%";
+        const std::wstring stage = renderJobFog ? L"Rendering fog... " : L"Applying caustics... ";
+        renderFrame.status = stage + std::to_wstring(progress) + L"%";
     }
     if (renderWindow) InvalidateRect(renderWindow, nullptr, FALSE);
 }
@@ -2802,7 +3370,7 @@ void Editor::stopRender() {
 
 void Editor::addGeometry(ObjectKind kind) {
     if (kind == ObjectKind::Camera) { addCamera(true); return; }
-    if (models.size() >= 10000) return;
+    if (models.size() >= maxSceneObjects) return;
     std::vector<Bounds> bounds;
     int count = 0;
     for (const Model& model : models) {
@@ -2851,7 +3419,7 @@ void Editor::syncCameras() {
 }
 
 void Editor::addCamera(bool selectNew) {
-    if (models.size() >= 10000) return;
+    if (models.size() >= maxSceneObjects) return;
     const int count = int(std::count_if(models.begin(), models.end(), [](const Model& model) {
         return model.kind == ObjectKind::Camera;
     }));
@@ -2956,6 +3524,7 @@ std::wstring pickFile(HWND owner, bool save, bool obj = false, const std::wstrin
 }
 
 bool Editor::saveScene(bool saveAs) {
+    resetDynamics();
     endDrag();
     const std::wstring path = currentPath.empty() || saveAs ? pickFile(window, true, false, currentPath) : currentPath;
     if (path.empty()) return false;
@@ -2970,6 +3539,7 @@ bool Editor::saveScene(bool saveAs) {
     }
     document.rendering = renderSettings;
     document.timeline = timeline;
+    document.dynamics = dynamicsSettings;
     document.activeView = activeView;
     document.selected = selected;
     if (!writeScene(path.c_str(), document)) {
@@ -2983,6 +3553,7 @@ bool Editor::saveScene(bool saveAs) {
 }
 
 void Editor::openScene() {
+    resetDynamics();
     endDrag();
     const std::wstring path = pickFile(window, false);
     if (path.empty()) return;
@@ -3025,6 +3596,7 @@ void Editor::openScene() {
     }
     renderSettings = document.rendering;
     timeline = document.timeline;
+    dynamicsSettings = document.dynamics;
     activeView = document.activeView;
     materialFirstRow = listOffset = 0;
     selected = -1;
@@ -3048,6 +3620,7 @@ bool Editor::confirmLeaveScene() {
 }
 
 void Editor::newScene() {
+    resetDynamics();
     endDrag();
     if (!confirmLeaveScene()) return;
     stopRender();
@@ -3057,6 +3630,7 @@ void Editor::newScene() {
     views = defaultViews;
     renderSettings = {};
     timeline = {};
+    dynamicsSettings = {};
     selected = -1;
     selection.clear();
     activeView = materialFirstRow = listOffset = 0;
@@ -3081,8 +3655,9 @@ void Editor::importModels() {
         MessageBoxW(window, error.c_str(), L"Import OBJ", MB_OK | MB_ICONERROR);
         return;
     }
-    if (models.size() + imported.size() > 10000) {
-        MessageBoxW(window, L"This scene would exceed 10000 objects.", L"Import OBJ", MB_OK | MB_ICONWARNING);
+    if (models.size() + imported.size() > maxSceneObjects) {
+        const auto message = L"This scene would exceed " + std::to_wstring(maxSceneObjects) + L" objects.";
+        MessageBoxW(window, message.c_str(), L"Import OBJ", MB_OK | MB_ICONWARNING);
         return;
     }
     remember();
@@ -3116,7 +3691,8 @@ void Editor::updateTitle() const {
 }
 
 Editor::SceneState Editor::sceneState() const {
-    return {models, materials, views, renderSettings, timeline, selected, activeView, revision, selection};
+    return {models, materials, views, renderSettings, timeline, dynamicsSettings, selected, activeView, revision,
+            selection, selectedFaces};
 }
 
 void Editor::restore(SceneState&& state) {
@@ -3125,6 +3701,7 @@ void Editor::restore(SceneState&& state) {
     views = state.views;
     renderSettings = state.rendering;
     timeline = state.animation;
+    dynamicsSettings = state.dynamics;
     revision = state.revision;
     activeView = state.activeView;
     selected = -1;
@@ -3132,16 +3709,15 @@ void Editor::restore(SceneState&& state) {
     layout(width, height);
     select(state.selected);
     selection = std::move(state.selection);
+    if (selectsFaces(tool)) selectedFaces = std::move(state.faceSelection);
     shadowMapsDirty = true;
     updateTitle();
     repaint();
 }
 
 void Editor::record(SceneState&& before) {
-    constexpr std::size_t historyLimit = 32;
-    constexpr std::size_t meshBudget = 64 * 1024 * 1024;
     undoHistory.push_back(std::move(before));
-    if (undoHistory.size() > historyLimit) undoHistory.erase(undoHistory.begin());
+    if (undoHistory.size() > undoHistoryLimit) undoHistory.erase(undoHistory.begin());
     std::size_t bytes = 0;
     std::size_t first = undoHistory.size() - 1;
     for (std::size_t i = undoHistory.size(); i-- > 0;) {
@@ -3150,7 +3726,7 @@ void Editor::record(SceneState&& before) {
                      model.mesh.faces.size() * sizeof(MeshFace) + model.keys.size() * sizeof(TransformKey) +
                      model.defaultTextureUvs.size() * sizeof(std::array<Vec2,4>);
         }
-        if (bytes > meshBudget) break;
+        if (bytes > undoMeshBudgetBytes) break;
         first = i;
     }
     undoHistory.erase(undoHistory.begin(), undoHistory.begin() + first);
@@ -3174,6 +3750,11 @@ void Editor::commitInteraction() {
 
 void Editor::undo(bool redo) {
     stopPlayback();
+    resetDynamics();
+    if (meshEdit) {
+        undoMeshChange(redo);
+        return;
+    }
     endDrag();
     auto& source = redo ? redoHistory : undoHistory;
     auto& destination = redo ? undoHistory : redoHistory;
@@ -3184,6 +3765,53 @@ void Editor::undo(bool redo) {
     restore(std::move(state));
 }
 
+void Editor::recordMeshChange(MeshEditChange change) {
+    auto& edit = *meshEdit;
+    change.mode = edit.mode;
+    change.components = edit.components;
+    auto& history = edit.undoHistory;
+    history.push_back(std::move(change));
+    edit.redoHistory.clear();
+    std::size_t first = history.size() - 1, bytes = 0;
+    for (std::size_t i = history.size(); i-- > 0;) {
+        const auto& entry = history[i];
+        bytes += entry.components.size() * sizeof(std::size_t) + entry.positions.size() * sizeof(entry.positions.front()) +
+                 entry.defaultUvs.size() * sizeof(entry.defaultUvs.front());
+        if (entry.topology) bytes += entry.topology->vertices.size() * sizeof(Vec3) +
+                                     entry.topology->faces.size() * sizeof(MeshFace);
+        if (bytes > undoMeshBudgetBytes || history.size() - i > undoHistoryLimit) break;
+        first = i;
+    }
+    history.erase(history.begin(), history.begin() + first);
+}
+
+void Editor::undoMeshChange(bool redo) {
+    const bool activeEdit = drag.view >= 0 && (drag.kind == DragKind::Component || drag.kind == DragKind::Extrude);
+    endDrag();
+    if (activeEdit) {
+        repaint();
+        return;
+    }
+    auto& edit = *meshEdit;
+    auto& source = redo ? edit.redoHistory : edit.undoHistory;
+    auto& destination = redo ? edit.undoHistory : edit.redoHistory;
+    if (source.empty()) return;
+    auto change = std::move(source.back());
+    source.pop_back();
+    if (change.topology) {
+        std::swap(edit.draft.mesh, *change.topology);
+        std::swap(edit.draft.kind, change.kind);
+        std::swap(edit.draft.defaultTextureUvs, change.defaultUvs);
+    } else {
+        for (auto& [index, position] : change.positions) std::swap(edit.draft.mesh.vertices[index], position);
+    }
+    startMeshEdit(change.mode);
+    edit.components = change.components;
+    refreshComponentVertices();
+    destination.push_back(std::move(change));
+    repaint();
+}
+
 void Editor::duplicate() {
     endDrag();
     if (selected < 0) return;
@@ -3192,7 +3820,7 @@ void Editor::duplicate() {
     int next = int(models.size());
     for (int i = 0; i < int(copies.size()); ++i)
         if (i == original || isDescendant(models, i, original)) copies[i] = next++;
-    if (next > 10000) return;
+    if (next > int(maxSceneObjects)) return;
     remember();
     for (int i = 0; i < int(copies.size()); ++i) {
         if (copies[i] < 0) continue;
@@ -3267,7 +3895,7 @@ std::vector<int> Editor::selectedRoots() const {
 void Editor::groupSelection() {
     endDrag();
     const auto roots = selectedRoots();
-    if (roots.size() < 2 || models.size() >= 10000) return;
+    if (roots.size() < 2 || models.size() >= maxSceneObjects) return;
     Model group;
     group.kind = ObjectKind::Group;
     group.parent = models[roots.front()].parent;
@@ -3419,11 +4047,12 @@ void Editor::frameSelection() {
     if (selected < 0) return;
     View& view = views[activeView];
     const Model& model = models[selected];
-    Bounds bounds = isGeometry(model.kind) ? modelBounds(model)
+    Bounds bounds = isGeometry(model.kind) || isFog(model.kind) ? modelBounds(model)
         : Bounds{model.transform.position - Vec3{.5, .5, .5}, model.transform.position + Vec3{.5, .5, .5}};
     if (model.kind == ObjectKind::Group) {
         for (int i = 0; i < int(models.size()); ++i) {
-            if (!isGeometry(models[i].kind) || !objectVisible(models, i) || !isDescendant(models, i, selected)) continue;
+            if ((!isGeometry(models[i].kind) && !isFog(models[i].kind)) ||
+                !objectVisible(models, i) || !isDescendant(models, i, selected)) continue;
             const Bounds child = modelBounds(models[i]);
             bounds.min = {std::min(bounds.min.x, child.min.x), std::min(bounds.min.y, child.min.y),
                           std::min(bounds.min.z, child.min.z)};
@@ -3436,7 +4065,7 @@ void Editor::frameSelection() {
     view.camera = -1;
     view.target = bounds.center();
     const double aspect = std::min(1.0, double(view.rect.w) / std::max(1, view.rect.h));
-    view.zoom = std::clamp((view.perspective ? 7.8 * aspect : 7.8) / diameter, minViewZoom, 8.0);
+    view.zoom = std::clamp((view.perspective ? 7.8 * aspect : 7.8) / diameter, minViewZoom, maxViewZoom);
     repaint();
 }
 
@@ -3505,7 +4134,7 @@ void Editor::setMeshShading(MeshShading mode) {
 }
 
 void Editor::addLight(ObjectKind kind) {
-    if (models.size() >= 10000) return;
+    if (models.size() >= maxSceneObjects) return;
     const int count = int(std::count_if(models.begin(), models.end(), [kind](const Model& model) {
         return model.kind == kind;
     }));
@@ -3528,6 +4157,21 @@ void Editor::addLight(ObjectKind kind) {
                       -1, kind, light});
     shadowMapsDirty = true;
     select(int(models.size()) - 1);
+}
+
+void Editor::addFog() {
+    if (models.size() >= maxSceneObjects) return;
+    const auto count = std::ranges::count_if(models, [](const Model& model) { return isFog(model.kind); });
+    constexpr std::array<double, 3> initialSize{5, 2.5, 5};
+    Model volume;
+    volume.kind = ObjectKind::Fog;
+    volume.name = "Fog " + std::to_string(count + 1);
+    volume.transform.position = {double(count) * 2, 1.25, 0};
+    volume.transform.size = initialSize;
+    remember();
+    models.push_back(std::move(volume));
+    select(int(models.size()) - 1);
+    setTool(Tool::Move);
 }
 
 std::vector<Editor::SceneRow> Editor::sceneRows() const {
@@ -3608,7 +4252,7 @@ void Editor::openTextureMeshEditor() {
     const int original = current.material >= 0 && !materials[current.material]->edit.image.pixels.empty() ? current.material : -1;
     int texture = original;
     TextureUvs result;
-    if (!editTextureMesh(window, base, defaults, startUnfolded, textures, texture, result)) return;
+    if (!editTextureMesh(window, base, current.transform, defaults, startUnfolded, textures, texture, result)) return;
     bool uvChanged = false;
     for (std::size_t i = 0; i < result.size() && !uvChanged; ++i) {
         for (std::size_t j = 0; j < base.faces[i].count; ++j) {
@@ -3660,6 +4304,10 @@ void Editor::openTextureMeshEditor() {
 bool Editor::propertyClick(Vec2 p) {
     if (!properties().contains(p)) return false;
     if (inspectButton().contains(p)) { inspect(); return true; }
+    if (emitterSelected()) {
+        if (emitterSettingsButton().contains(p)) configureEmitter();
+        return true;
+    }
     if (geometrySelected()) {
         if (textureMeshButton().contains(p)) { openTextureMeshEditor(); return true; }
         for (int i = 0; i < 3; ++i) {
@@ -3673,6 +4321,51 @@ bool Editor::propertyClick(Vec2 p) {
         return modifierClick(p);
     }
     if (cameraSelected() && lightSetupButton().contains(p)) lookThroughCamera();
+    if (fogSelected()) {
+        auto& settings = models[selected].fog;
+        auto updated = settings;
+        bool changed = false;
+        if (fogOption(0).contains(p)) {
+            updated.style = settings.style == FogStyle::Mist ? FogStyle::Cloud : FogStyle::Mist;
+            changed = true;
+        } else if (fogOption(1).contains(p)) {
+            changed = editWholeNumber(window, L"Fog Density", L"Density (%)",
+                                      updated.density, minFogDensity, maxFogDensity) && updated.density != settings.density;
+        } else if (fogOption(2).contains(p)) {
+            changed = editWholeNumber(window, L"Fog Noise Scale", L"Noise scale",
+                                      updated.detail, minFogDetail, maxFogDetail) && updated.detail != settings.detail;
+        } else if (fogOption(3).contains(p)) {
+            changed = editWholeNumber(window, L"Fog Flow", L"Flow (%)",
+                                      updated.flow, minFogFlow, maxFogFlow) && updated.flow != settings.flow;
+        } else if (fogOption(4).contains(p)) changed = editLightColor(window, updated.color);
+        else if (fogOption(fogQualityRow).contains(p)) {
+            const HMENU menu = CreatePopupMenu();
+            if (!menu) return true;
+            for (std::size_t i = 0; i < fogQualityMenuNames.size(); ++i) {
+                const bool active = std::size_t(settings.quality) == i;
+                AppendMenuW(menu, MF_STRING | (active ? MF_CHECKED : MF_UNCHECKED),
+                            UINT_PTR(i + 1), fogQualityMenuNames[i]);
+            }
+            const auto button = fogOption(fogQualityRow);
+            POINT anchor{button.x, button.y + button.h};
+            ClientToScreen(window, &anchor);
+            const UINT choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, anchor.x, anchor.y,
+                                               0, window, nullptr);
+            DestroyMenu(menu);
+            if (choice != 0) {
+                updated.quality = FogQuality(choice - 1);
+                changed = updated.quality != settings.quality;
+            }
+        } else if (fogShadowsButton().contains(p)) {
+            updated.shadows = !settings.shadows;
+            changed = true;
+        }
+        if (changed) {
+            remember();
+            settings = updated;
+        }
+        return true;
+    }
     if (!lightSelected()) return true;
     Model& model = models[selected];
     if (lightColorButton().contains(p)) {
@@ -3781,7 +4474,7 @@ bool Editor::modifierClick(Vec2 point) {
     return true;
 }
 
-void Editor::mouseDown(Vec2 p, bool orbit, bool toggle) {
+void Editor::mouseDown(Vec2 p, bool orbit, bool toggle, bool marquee) {
     if (drag.view >= 0 || adjustingTransparency || scrubbingTimeline) return;
     const int index = viewAt(p);
     if (orbit && index >= 0) {
@@ -3802,13 +4495,56 @@ void Editor::mouseDown(Vec2 p, bool orbit, bool toggle) {
         SetCapture(window);
         return;
     }
+    if (dynamicsButton().contains(p)) {
+        if (!meshEdit) flyout = flyout == Flyout::Dynamics ? Flyout::None : Flyout::Dynamics;
+        return;
+    }
+    if (!meshEdit && flyout == Flyout::Dynamics && dynamicsMenu().contains(p)) {
+        const int action = int(p.y - dynamicsMenu().y) / dynamicsMenuRowHeight;
+        flyout = Flyout::None;
+        switch (action) {
+        case 0: configureDynamics(); break;
+        case 1: toggleDynamics(); break;
+        case 2: resetDynamics(); break;
+        case 3: bakeDynamics(); break;
+        case 4: addEmitter(false); break;
+        case 5: addEmitter(true); break;
+        case 6: keepWaterSurface(); break;
+        }
+        return;
+    }
+    resetDynamics();
     if (!timelinePanel().contains(p)) stopPlayback();
+    if (selectButton().contains(p)) {
+        setTool(Tool::Select);
+        return;
+    }
+    if (effectsButton().contains(p)) {
+        if (!meshEdit) flyout = flyout == Flyout::Effects ? Flyout::None : Flyout::Effects;
+        return;
+    }
+    if (!meshEdit && flyout == Flyout::Effects && effectsMenu().contains(p)) {
+        flyout = Flyout::None;
+        addFog();
+        return;
+    }
     if (transformButton().contains(p)) {
         flyout = flyout == Flyout::Transform ? Flyout::None : Flyout::Transform;
         return;
     }
     if (flyout == Flyout::Transform && transformMenu().contains(p)) {
         setTool(static_cast<Tool>(int(p.y - transformMenu().y) / 36));
+        return;
+    }
+    if (modelingButton().contains(p)) {
+        flyout = flyout == Flyout::Modeling ? Flyout::None : Flyout::Modeling;
+        return;
+    }
+    if (flyout == Flyout::Modeling && modelingMenu().contains(p)) {
+        const int item = int(p.y - modelingMenu().y) / 36;
+        if (item == 0) setTool(Tool::Extrude);
+        else if (!meshEdit && item == 1) cutSelection();
+        else if (!meshEdit) bridgeSelection();
         return;
     }
     if (meshEdit) {
@@ -3821,7 +4557,8 @@ void Editor::mouseDown(Vec2 p, bool orbit, bool toggle) {
             const auto& view = views[index];
             const bool header = viewportNameArea(view).contains(p) || viewportModeButton(view).contains(p) ||
                                 viewportCameraButton(view).contains(p);
-            beginComponentDrag(index, p, header);
+            if (marquee && !header) beginMarquee(index, p, toggle);
+            else beginComponentDrag(index, p, header, toggle);
         }
         return;
     }
@@ -3837,25 +4574,23 @@ void Editor::mouseDown(Vec2 p, bool orbit, bool toggle) {
         flyout = flyout == Flyout::Lighting ? Flyout::None : Flyout::Lighting;
         return;
     }
-    if (modelingButton().contains(p)) {
-        flyout = flyout == Flyout::Modeling ? Flyout::None : Flyout::Modeling;
+    if (flyout == Flyout::Crystals && crystalMenu().contains(p)) {
+        flyout = Flyout::None;
+        addGeometry(crystalKinds[int(p.y - crystalMenu().y) / 36]);
         return;
     }
-    if (flyout == Flyout::Creation && boxMenu().contains(p)) {
-        flyout = Flyout::None;
-        addGeometry(creationKinds[int(p.y - boxMenu().y) / 36]);
+    if ((flyout == Flyout::Creation || flyout == Flyout::Crystals) && boxMenu().contains(p)) {
+        const auto item = std::size_t((p.y - boxMenu().y) / 36);
+        if (item == std::size(creationKinds)) flyout = Flyout::Crystals;
+        else {
+            flyout = Flyout::None;
+            addGeometry(creationKinds[item]);
+        }
         return;
     }
     if (flyout == Flyout::Lighting && lightingMenu().contains(p)) {
         addLight(static_cast<ObjectKind>(1 + int(p.y - lightingMenu().y) / 36));
         flyout = Flyout::None;
-        return;
-    }
-    if (flyout == Flyout::Modeling && modelingMenu().contains(p)) {
-        const int item = int(p.y - modelingMenu().y) / 36;
-        if (item == 0) setTool(Tool::Extrude);
-        else if (item == 1) cutSelection();
-        else bridgeSelection();
         return;
     }
     if (timelineClick(p)) return;
@@ -3985,37 +4720,58 @@ void Editor::mouseDown(Vec2 p, bool orbit, bool toggle) {
         if (picked != previouslySelected && models[picked].evaluatedMesh)
             hit = ModelCollider(models[picked], true).intersect(ray, nearPlane, farPlane);
         if (hit.face == noFace) return;
-        if (tool == Tool::Bridge && selectedFaces.size() == 2 &&
-            !std::binary_search(selectedFaces.begin(), selectedFaces.end(), hit.face)) selectedFaces.clear();
-        const auto entry = std::lower_bound(selectedFaces.begin(), selectedFaces.end(), hit.face);
-        const bool included = entry != selectedFaces.end() && *entry == hit.face;
-        if (toggle || tool == Tool::Bridge) {
-            if (included) selectedFaces.erase(entry);
-            else selectedFaces.insert(entry, hit.face);
+        if (tool == Tool::Extrude) {
+            pickExtrusionFace(index, p, hit.face, toggle);
             return;
         }
-        if (!included) selectedFaces = {hit.face};
-        Vec3 normal{};
-        const auto& model = models[picked];
-        for (auto face : selectedFaces) {
-            const auto polygon = faceGeometry(model, face, true);
-            normal = normal + cross(polygon.u, polygon.triangle ? polygon.v : polygon.diagonal);
-            if (!polygon.triangle) normal = normal + cross(polygon.diagonal, polygon.v);
-        }
-        normal = normalized(normal);
-        if (dot(normal,normal) < .5) normal = faceGeometry(model, hit.face, true).normal;
-        beginExtrusion(index, p, normal);
+        if (selectedFaces.size() == 2 &&
+            !std::binary_search(selectedFaces.begin(), selectedFaces.end(), hit.face)) selectedFaces.clear();
+        const auto entry = std::lower_bound(selectedFaces.begin(), selectedFaces.end(), hit.face);
+        if (entry != selectedFaces.end() && *entry == hit.face) selectedFaces.erase(entry);
+        else selectedFaces.insert(entry, hit.face);
         return;
     }
     if (selectsFaces(tool) && toggle) return;
+    if (picked < 0 && !selectsFaces(tool)) {
+        for (int i = 0; i < int(models.size()); ++i) {
+            if (!isFog(models[i].kind) || !objectVisible(models, i)) continue;
+            const auto volume = intersectBox(ray, models[i].transform, nearPlane, hit.distance);
+            if (volume.distance >= hit.distance) continue;
+            hit = volume;
+            picked = i;
+        }
+    }
     if (picked < 0 && cameraSelected()) return;
     select(picked, toggle);
 }
 
+void Editor::pickExtrusionFace(int index, Vec2 point, std::size_t face, bool toggle) {
+    auto& faces = meshEdit ? meshEdit->components : selectedFaces;
+    const auto entry = std::lower_bound(faces.begin(), faces.end(), face);
+    const bool included = entry != faces.end() && *entry == face;
+    if (toggle) {
+        if (included) faces.erase(entry);
+        else faces.insert(entry, face);
+    } else if (!included) faces = {face};
+    if (meshEdit) refreshComponentVertices();
+    if (toggle) return;
+
+    const auto& model = extrusionModel();
+    Vec3 normal{};
+    for (auto selectedFace : faces) {
+        const auto polygon = faceGeometry(model, selectedFace, true);
+        normal = normal + cross(polygon.u, polygon.triangle ? polygon.v : polygon.diagonal);
+        if (!polygon.triangle) normal = normal + cross(polygon.diagonal, polygon.v);
+    }
+    normal = normalized(normal);
+    if (dot(normal,normal) < .5) normal = faceGeometry(model, face, true).normal;
+    beginExtrusion(index, point, normal);
+}
+
 void Editor::beginExtrusion(int index, Vec2 point, Vec3 direction, bool axisDrag) {
     const View& view = views[index];
-    const Model& model = models[selected];
-    const Vec3 center = extrusionCenter();
+    const Model& model = extrusionModel();
+    const Vec3 center = meshEdit ? componentCenter() : extrusionCenter();
     const double depth = view.depth(center);
     if (depth <= nearPlane) return;
 
@@ -4043,7 +4799,7 @@ void Editor::beginExtrusion(int index, Vec2 point, Vec3 direction, bool axisDrag
     }
     if (towardCamera > 0 || (axisDrag && towardCamera < 0)) {
         double nearest = depth;
-        for (auto index : selectedFaces) {
+        for (const auto index : extrusionFaces()) {
             const auto face = faceGeometry(model, index, true);
             const auto corners = face.corners();
             for (std::size_t i = 0; i < face.count(); ++i) nearest = std::min(nearest, view.depth(corners[i]));
@@ -4052,8 +4808,10 @@ void Editor::beginExtrusion(int index, Vec2 point, Vec3 direction, bool axisDrag
         if (towardCamera > 0) extrusion.maximum = limit;
         else extrusion.minimum = -limit;
     }
-    updateShadowMaps();
-    startInteraction();
+    if (!meshEdit) {
+        updateShadowMaps();
+        startInteraction();
+    }
     SetCapture(window);
 }
 
@@ -4063,9 +4821,12 @@ void Editor::updateExtrusion(Vec2 delta) {
     const double distance = projected / std::max(.1, 1 + projected * extrusion.perspectiveFactor);
     extrusion.distance = std::clamp(distance, extrusion.signedDirection ? extrusion.minimum : 0.0, extrusion.maximum);
     if (std::abs(pixels) < 3 || std::abs(extrusion.distance) < .0001) extrusion.distance = 0;
-    Model& model = models[selected];
+    Model& model = meshEdit ? meshEdit->draft : models[selected];
     if (extrusion.distance == 0) {
-        if (extrusion.changed) model.mesh = std::move(extrusion.before);
+        if (extrusion.changed) {
+            model.mesh = std::move(extrusion.before);
+            if (meshEdit) refreshComponentVertices();
+        }
         extrusion.changed = false;
         return;
     }
@@ -4073,13 +4834,14 @@ void Editor::updateExtrusion(Vec2 delta) {
     if (!extrusion.changed) {
         if (extrusion.unavailable) return;
         Mesh result = modelMesh(model, true);
-        if (!prepareExtrusion(result, selectedFaces, extrusion.topology)) {
+        if (!prepareExtrusion(result, extrusionFaces(), extrusion.topology)) {
             extrusion.unavailable = true;
             return;
         }
         extrusion.before = std::move(model.mesh);
         model.mesh = std::move(result);
         extrusion.changed = true;
+        if (meshEdit) refreshComponentVertices();
     }
     for (const auto& moved : extrusion.topology.moved) model.mesh.vertices[moved.index] = moved.original + offset;
 }
@@ -4089,9 +4851,10 @@ void Editor::finishExtrusion(bool commit) {
     const wchar_t* failure = extrusion.unavailable
         ? L"Select a region with a boundary and a manifold mesh within the editor limits." : nullptr;
     if (extrusion.changed) {
-        Model& model = models[selected];
+        Model& model = meshEdit ? meshEdit->draft : models[selected];
         if (commit) {
-            const auto wallStart = modelMesh(interactionBefore->models[selected], true).faces.size();
+            const auto wallStart = meshEdit ? extrusion.before.faces.size()
+                                            : modelMesh(interactionBefore->models[selected], true).faces.size();
             for (std::size_t i = wallStart; i < model.mesh.faces.size(); ++i) {
                 const auto& face = model.mesh.faces[i];
                 const auto& points = model.mesh.vertices;
@@ -4103,14 +4866,28 @@ void Editor::finishExtrusion(bool commit) {
             }
             if (!failure && !orientExtrusion(model.mesh, extrusion.topology))
                 failure = L"That direction gives the extrusion zero volume. Try another axis or drag the faces.";
-            if (!failure && !rebuildModifiers(model)) failure = L"Extruding these faces would exceed the Smooth mesh limit.";
+            if (!failure && !meshEdit && !rebuildModifiers(model))
+                failure = L"Extruding these faces would exceed the Smooth mesh limit.";
         }
         if (commit && !failure) {
+            if (meshEdit) {
+                MeshEditChange change{};
+                change.topology = std::move(extrusion.before);
+                change.kind = model.kind;
+                change.defaultUvs = std::move(model.defaultTextureUvs);
+                recordMeshChange(std::move(change));
+            }
             if (model.kind == ObjectKind::Plane) model.kind = ObjectKind::Mesh;
             model.defaultTextureUvs.clear();
-            shadowMapsDirty = true;
-            interactionChanged = true;
-        } else model.mesh = std::move(extrusion.before);
+            if (meshEdit) refreshComponentVertices();
+            else {
+                shadowMapsDirty = true;
+                interactionChanged = true;
+            }
+        } else {
+            model.mesh = std::move(extrusion.before);
+            if (meshEdit) refreshComponentVertices();
+        }
     }
     extrusion = {};
     if (commit && failure) MessageBoxW(window, failure, L"Extrude", MB_OK | MB_ICONWARNING);
@@ -4137,32 +4914,46 @@ void Editor::setPlaneSegments(int axis) {
 void Editor::startMeshEdit(ComponentMode mode) {
     if (!geometrySelected() || !objectVisible(models, selected)) return;
     flyout = Flyout::None;
+    if (meshEdit && meshEdit->mode == mode) return;
+    endDrag();
     if (!meshEdit) {
         MeshEdit edit{};
         edit.draft = models[selected];
         edit.draft.mesh = modelMesh(models[selected], true);
         edit.draft.mesh.normals.clear();
-        for (const auto& face : edit.draft.mesh.faces) {
+        if (tool == Tool::Select) edit.tool = Tool::Select;
+        if (mode == ComponentMode::Polygon && tool == Tool::Extrude) {
+            edit.components = selectedFaces;
+            edit.tool = Tool::Extrude;
+        }
+        meshEdit = std::move(edit);
+    } else meshEdit->components.clear();
+    meshEdit->mode = mode;
+    if (mode == ComponentMode::Edge) {
+        auto& edges = meshEdit->edges;
+        edges.clear();
+        for (const auto& face : meshEdit->draft.mesh.faces) {
             for (std::size_t i = 0; i < face.count; ++i) {
                 const auto a = face.vertices[i], b = face.vertices[(i + 1) % face.count];
-                edit.edges.push_back({std::min(a,b), std::max(a,b)});
+                edges.push_back({std::min(a,b), std::max(a,b)});
             }
         }
-        std::sort(edit.edges.begin(), edit.edges.end());
-        edit.edges.erase(std::unique(edit.edges.begin(), edit.edges.end()), edit.edges.end());
-        meshEdit = std::move(edit);
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
     }
-    meshEdit->mode = mode;
-    meshEdit->count = 0;
+    refreshComponentVertices();
     if (!toolAvailable(meshEdit->tool)) meshEdit->tool = Tool::Move;
     updateTransformMenu();
 }
 
 void Editor::finishMeshEdit(bool commit) {
+    if (commit) finishExtrusion(true);
     endDrag(commit);
     if (!meshEdit) return;
-    const auto& original = modelMesh(models[selected], true).vertices;
-    const bool changed = !std::equal(original.begin(), original.end(), meshEdit->draft.mesh.vertices.begin(),
+    const auto& original = modelMesh(models[selected], true);
+    const auto& current = meshEdit->draft.mesh;
+    const bool changed = original.faces.size() != current.faces.size() ||
+        !std::equal(original.vertices.begin(), original.vertices.end(), current.vertices.begin(), current.vertices.end(),
         [](Vec3 a, Vec3 b) { const Vec3 delta = a - b; return dot(delta,delta) <= 1e-16; });
     if (commit && changed) {
         Model& draft = meshEdit->draft;
@@ -4179,7 +4970,10 @@ void Editor::finishMeshEdit(bool commit) {
             }
         }
         draft.kind = ObjectKind::Mesh;
-        if (!rebuildModifiers(draft)) return;
+        if (!rebuildModifiers(draft)) {
+            MessageBoxW(window, L"These edits exceed the active Smooth modifier limit.", L"Mesh Edit", MB_OK | MB_ICONWARNING);
+            return;
+        }
         remember();
         models[selected] = std::move(draft);
         shadowMapsDirty = true;
@@ -4194,11 +4988,31 @@ void Editor::finishMeshEdit(bool commit) {
 Vec3 Editor::componentCenter() const {
     const auto& edit = *meshEdit;
     Vec3 center{};
-    for (std::size_t i = 0; i < edit.count; ++i) center = center + edit.draft.mesh.vertices[edit.indices[i]];
-    return edit.draft.transform.position + worldVector(edit.draft.transform, center * (1.0 / edit.count));
+    for (const auto vertex : edit.vertices) center = center + edit.draft.mesh.vertices[vertex];
+    return edit.draft.transform.position + worldVector(edit.draft.transform, center * (1.0 / edit.vertices.size()));
 }
 
-void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
+void Editor::refreshComponentVertices() {
+    auto& edit = *meshEdit;
+    if (edit.mode == ComponentMode::Vertex) {
+        edit.vertices = edit.components;
+        return;
+    }
+    edit.vertices.clear();
+    for (const auto component : edit.components) {
+        if (edit.mode == ComponentMode::Edge) {
+            const auto edge = edit.edges[component];
+            edit.vertices.insert(edit.vertices.end(), edge.begin(), edge.end());
+        } else {
+            const auto& face = edit.draft.mesh.faces[component];
+            edit.vertices.insert(edit.vertices.end(), face.vertices.begin(), face.vertices.begin() + face.count);
+        }
+    }
+    std::sort(edit.vertices.begin(), edit.vertices.end());
+    edit.vertices.erase(std::unique(edit.vertices.begin(), edit.vertices.end()), edit.vertices.end());
+}
+
+void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly, bool toggle) {
     auto& edit = *meshEdit;
     const auto& view = views[index];
     const auto& mesh = edit.draft.mesh;
@@ -4206,7 +5020,9 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
         return edit.draft.transform.position + worldVector(edit.draft.transform, mesh.vertices[id]);
     };
     const auto begin = [&] {
-        for (std::size_t i = 0; i < edit.count; ++i) edit.original[i] = mesh.vertices[edit.indices[i]];
+        edit.original.clear();
+        edit.original.reserve(edit.vertices.size());
+        for (const auto vertex : edit.vertices) edit.original.push_back(mesh.vertices[vertex]);
         drag = {};
         drag.view = index;
         drag.kind = DragKind::Component;
@@ -4214,7 +5030,7 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
         drag.componentPivot = componentCenter();
         SetCapture(window);
     };
-    if (edit.count > 0 && edit.tool == Tool::Rotate) {
+    if (!toggle && !edit.vertices.empty() && edit.tool == Tool::Rotate) {
         Vec2 tangent;
         const int axis = pickRotationRing(view, point, tangent);
         if (axis >= 0) {
@@ -4223,7 +5039,7 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
             drag.tangent = tangent;
             return;
         }
-    } else if (edit.count > 0) {
+    } else if (!toggle && !edit.vertices.empty()) {
         const auto planes = planeHandles(view);
         for (int axis = 0; axis < 3; ++axis) {
             if (!hitPlaneHandle(planes[axis], point)) continue;
@@ -4245,6 +5061,10 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
             if (distance < nearest) { nearest = distance; axis = i; }
         }
         if (axis >= 0) {
+            if (edit.tool == Tool::Extrude) {
+                beginExtrusion(index, point, axes[axis], true);
+                return;
+            }
             begin();
             drag.axis = axis;
             const Vec2 span = arrows[axis].tip - arrows[axis].start;
@@ -4253,13 +5073,13 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
         }
     }
     if (handlesOnly) return;
-    edit.count = 0;
+    std::size_t picked = noFace;
     double depth = farPlane, best = 81;
     std::optional<ModelCollider> surface;
     const bool seeThrough = view.mode == ViewportMode::Wireframe ||
         (view.mode == ViewportMode::Software && edit.draft.material >= 0 &&
             materialOptics(materials[edit.draft.material]->edit).transmission > 0);
-    const auto consider = [&](std::size_t a, std::size_t b, std::size_t count) {
+    const auto consider = [&](std::size_t component, std::size_t a, std::size_t b) {
         const Vec3 A = world(a), B = world(b);
         if (view.depth(A) <= nearPlane || view.depth(B) <= nearPlane) return;
         const Vec2 start = view.project(A), end = view.project(B), span = end - start;
@@ -4278,24 +5098,36 @@ void Editor::beginComponentDrag(int index, Vec2 point, bool handlesOnly) {
         }
         best = distance;
         depth = candidateDepth;
-        edit.indices = {a,b};
-        edit.count = count;
+        picked = component;
     };
     if (edit.mode == ComponentMode::Vertex) {
-        for (std::size_t i = 0; i < mesh.vertices.size(); ++i) consider(i,i,1);
+        for (std::size_t i = 0; i < mesh.vertices.size(); ++i) consider(i,i,i);
     } else if (edit.mode == ComponentMode::Edge) {
-        for (const auto& edge : edit.edges) consider(edge[0],edge[1],2);
+        for (std::size_t i = 0; i < edit.edges.size(); ++i) consider(i, edit.edges[i][0], edit.edges[i][1]);
     } else {
         const Ray ray = view.ray(point);
         const auto hit = ModelCollider(edit.draft, true).intersect(ray, nearPlane, farPlane);
         if (hit.face != noFace) {
-            const auto& face = mesh.faces[hit.face];
-            edit.indices = face.vertices;
-            edit.count = face.count;
+            picked = hit.face;
             depth = view.depth(ray.origin + ray.direction * hit.distance);
         }
     }
-    if (!edit.count || edit.tool != Tool::Move) return;
+    if (picked == noFace) {
+        beginMarquee(index, point, toggle);
+        return;
+    }
+    if (edit.tool == Tool::Extrude) {
+        pickExtrusionFace(index, point, picked, toggle);
+        return;
+    }
+    const auto entry = std::lower_bound(edit.components.begin(), edit.components.end(), picked);
+    const bool included = entry != edit.components.end() && *entry == picked;
+    if (toggle) {
+        if (included) edit.components.erase(entry);
+        else edit.components.insert(entry, picked);
+    } else if (!included) edit.components = {picked};
+    refreshComponentVertices();
+    if (toggle || edit.tool != Tool::Move) return;
     begin();
     edit.unitsPerPixel = view.perspective ? depth / view.focal() : 1 / view.orthoScale();
 }
@@ -4307,15 +5139,132 @@ void Editor::drawComponentMarkers(const View& view) {
         if (view.depth(point) <= nearPlane) return {};
         return view.project(point);
     };
-    for (std::size_t i = 0; edit.count >= 2 && i < edit.count; ++i) {
-        const auto a = screen(edit.indices[i]), b = screen(edit.indices[(i+1) % edit.count]);
+    const auto segment = [&](std::size_t first, std::size_t second) {
+        const auto a = screen(first), b = screen(second);
         if (a && b) line(*a,*b,heading,2);
-        if (edit.count == 2) break;
+    };
+    if (edit.mode == ComponentMode::Edge) {
+        for (const auto index : edit.components) segment(edit.edges[index][0], edit.edges[index][1]);
+    } else if (edit.mode == ComponentMode::Polygon) {
+        for (const auto index : edit.components) {
+            const auto& face = edit.draft.mesh.faces[index];
+            for (std::size_t i = 0; i < face.count; ++i)
+                segment(face.vertices[i], face.vertices[(i + 1) % face.count]);
+        }
     }
+}
+
+void Editor::beginMarquee(int index, Vec2 point, bool additive) {
+    drag = {};
+    drag.view = index;
+    drag.kind = DragKind::Marquee;
+    drag.mouse = drag.marqueeEnd = point;
+    drag.additiveMarquee = additive;
+    SetCapture(window);
+}
+
+Rect Editor::marqueeBounds() const {
+    const Rect view = views[drag.view].rect;
+    const int x = std::clamp(int(drag.marqueeEnd.x), view.x, view.x + view.w - 1);
+    const int y = std::clamp(int(drag.marqueeEnd.y), view.y, view.y + view.h - 1);
+    const int startX = int(drag.mouse.x), startY = int(drag.mouse.y);
+    return {std::min(x, startX), std::min(y, startY), std::abs(x - startX) + 1, std::abs(y - startY) + 1};
+}
+
+bool segmentOverlapsRect(Vec2 a, Vec2 b, const Rect& box) {
+    double first = 0, last = 1;
+    const auto clip = [&](double origin, double direction, double low, double high) {
+        if (std::abs(direction) < 1e-10) return origin >= low && origin <= high;
+        double enter = (low - origin) / direction, exit = (high - origin) / direction;
+        if (enter > exit) std::swap(enter, exit);
+        first = std::max(first, enter);
+        last = std::min(last, exit);
+        return first <= last;
+    };
+    return clip(a.x, b.x - a.x, box.x, box.x + box.w) && clip(a.y, b.y - a.y, box.y, box.y + box.h);
+}
+
+bool overlapsMarquee(const View& view, const Rect& box, std::array<Vec3, 12> corners, std::size_t count) {
+    // Clip to the depth range before projecting edges and faces that cross the camera.
+    const auto clipDepth = [&](double depth, bool keepFarther) {
+        std::array<Vec3, 12> clipped{};
+        std::size_t out = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto next = (i + 1) % count;
+            const double a = view.depth(corners[i]) - depth, b = view.depth(corners[next]) - depth;
+            const bool inside = keepFarther ? a >= 0 : a <= 0;
+            if (inside) clipped[out++] = corners[i];
+            if (inside != (keepFarther ? b >= 0 : b <= 0))
+                clipped[out++] = corners[i] + (corners[next] - corners[i]) * (a / (a - b));
+        }
+        corners = clipped;
+        count = out;
+    };
+    clipDepth(nearPlane, true);
+    clipDepth(farPlane, false);
+    if (!count) return false;
+
+    std::array<Vec2, 12> points{};
+    for (std::size_t i = 0; i < count; ++i) {
+        points[i] = view.project(corners[i]);
+        if (box.contains(points[i])) return true;
+    }
+    if (count == 1) return false;
+    bool inside = false;
+    const auto center = box.center();
+    for (std::size_t i = 0; i < count; ++i) {
+        const Vec2 a = points[i], b = points[(i + 1) % count];
+        if (segmentOverlapsRect(a, b, box)) return true;
+        if ((a.y > center.y) != (b.y > center.y) &&
+            center.x < a.x + (b.x - a.x) * (center.y - a.y) / (b.y - a.y)) inside = !inside;
+    }
+    return inside;
+}
+
+void Editor::finishMarquee() {
+    auto& edit = *meshEdit;
+    const auto box = marqueeBounds();
+    std::vector<std::size_t> hits;
+    if (std::max(box.w, box.h) >= 5) {
+        const auto& view = views[drag.view];
+        const auto& mesh = edit.draft.mesh;
+        const auto& transform = edit.draft.transform;
+        const auto world = [&](std::size_t i) { return transform.position + worldVector(transform, mesh.vertices[i]); };
+        if (edit.mode == ComponentMode::Vertex) {
+            for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+                const Vec3 point = world(i);
+                const double depth = view.depth(point);
+                if (depth >= nearPlane && depth <= farPlane && box.contains(view.project(point))) hits.push_back(i);
+            }
+        } else if (edit.mode == ComponentMode::Edge) {
+            for (std::size_t i = 0; i < edit.edges.size(); ++i) {
+                const auto& edge = edit.edges[i];
+                if (overlapsMarquee(view, box, {world(edge[0]), world(edge[1])}, 2)) hits.push_back(i);
+            }
+        } else {
+            for (std::size_t i = 0; i < mesh.faces.size(); ++i) {
+                const auto& face = mesh.faces[i];
+                std::array<Vec3, 12> corners{};
+                for (std::size_t j = 0; j < face.count; ++j) corners[j] = world(face.vertices[j]);
+                if (overlapsMarquee(view, box, corners, face.count)) hits.push_back(i);
+            }
+        }
+    }
+    if (drag.additiveMarquee) {
+        std::vector<std::size_t> selection;
+        std::set_union(edit.components.begin(), edit.components.end(), hits.begin(), hits.end(),
+                       std::back_inserter(selection));
+        edit.components = std::move(selection);
+    } else edit.components = std::move(hits);
+    refreshComponentVertices();
 }
 
 void Editor::mouseMove(Vec2 p) {
     if (drag.view < 0) return;
+    if (drag.kind == DragKind::Marquee) {
+        drag.marqueeEnd = p;
+        return;
+    }
     View& view = views[drag.view];
     const Vec2 delta = p - drag.mouse;
     if (drag.kind == DragKind::Pan) {
@@ -4356,10 +5305,10 @@ void Editor::mouseMove(Vec2 p) {
         if (edit.tool == Tool::Scale) {
             const auto factors = dragScaleFactors(view, drag.componentPivot, axes, drag.axis, drag.plane, delta, drag.tangent);
             const Vec3 pivot = localVector(transform, drag.componentPivot - transform.position);
-            for (std::size_t i = 0; i < edit.count; ++i) {
+            for (std::size_t i = 0; i < edit.vertices.size(); ++i) {
                 const Vec3 world = worldVector(transform, edit.original[i] - pivot);
                 const Vec3 scaled{world.x * factors[0], world.y * factors[1], world.z * factors[2]};
-                edit.draft.mesh.vertices[edit.indices[i]] = pivot + localVector(transform,scaled);
+                edit.draft.mesh.vertices[edit.vertices[i]] = pivot + localVector(transform,scaled);
             }
             return;
         }
@@ -4367,9 +5316,9 @@ void Editor::mouseMove(Vec2 p) {
             const Vec3 axis = axes[drag.axis];
             const double angle = rotationDragAngle(view, drag.componentPivot, drag.axis, drag.mouse, p, drag.tangent);
             const Vec3 localPivot = localVector(transform, drag.componentPivot - transform.position);
-            for (std::size_t i = 0; i < edit.count; ++i) {
+            for (std::size_t i = 0; i < edit.vertices.size(); ++i) {
                 const Vec3 world = worldVector(transform, edit.original[i] - localPivot);
-                edit.draft.mesh.vertices[edit.indices[i]] = localPivot + localVector(transform, rotated(world, axis, angle));
+                edit.draft.mesh.vertices[edit.vertices[i]] = localPivot + localVector(transform, rotated(world, axis, angle));
             }
             return;
         }
@@ -4382,8 +5331,8 @@ void Editor::mouseMove(Vec2 p) {
             displacement = (view.right * delta.x - view.up * delta.y) * edit.unitsPerPixel;
         }
         const Vec3 offset = localVector(transform, displacement);
-        for (std::size_t i = 0; i < edit.count; ++i)
-            edit.draft.mesh.vertices[edit.indices[i]] = edit.original[i] + offset;
+        for (std::size_t i = 0; i < edit.vertices.size(); ++i)
+            edit.draft.mesh.vertices[edit.vertices[i]] = edit.original[i] + offset;
         return;
     }
 
@@ -4402,7 +5351,8 @@ void Editor::mouseMove(Vec2 p) {
     if (tool == Tool::Scale) {
         const auto factors = dragScaleFactors(view, initial, drag.initialModel.basis.data(), drag.axis,
                                               drag.plane, delta, drag.tangent, group);
-        for (int i = 0; i < 3; ++i) transform.size[i] = std::clamp(drag.initialModel.size[i] * factors[i], .05, 100.0);
+        for (int i = 0; i < 3; ++i)
+            transform.size[i] = std::clamp(drag.initialModel.size[i] * factors[i], minObjectScale, maxObjectScale);
         updateTransform();
         return;
     }
@@ -4432,20 +5382,20 @@ void Editor::transformGroup(int index, const std::vector<Model>& before) {
     for (int i = 0; i < int(models.size()); ++i)
         if (isDescendant(models, i, index)) descendants.push_back(i);
     if (ratio != 1) {
-        double minimum = 0, maximum = 100.0 / initial.size[0];
+        double minimum = 0, maximum = maxObjectScale / initial.size[0];
         const auto limit = [&](const Transform& pose) {
             for (double size : pose.size) {
-                minimum = std::max(minimum, .05 / size);
-                maximum = std::min(maximum, 100.0 / size);
+                minimum = std::max(minimum, minObjectScale / size);
+                maximum = std::min(maximum, maxObjectScale / size);
             }
         };
         for (int i : descendants) {
-            if (!isGeometry(before[i].kind) && before[i].kind != ObjectKind::Group) continue;
+            if (!isGeometry(before[i].kind) && !isFog(before[i].kind) && before[i].kind != ObjectKind::Group) continue;
             limit(before[i].transform);
             for (const auto& key : before[i].keys) limit(key.pose);
         }
         ratio = std::clamp(ratio, std::min(1.0, minimum), std::max(1.0, maximum));
-        target.size.fill(std::clamp(initial.size[0] * ratio, .05, 100.0));
+        target.size.fill(std::clamp(initial.size[0] * ratio, minObjectScale, maxObjectScale));
     }
     const auto rotate = [&](Vec3 vector) {
         return target.basis[0] * dot(vector, initial.basis[0]) +
@@ -4456,11 +5406,11 @@ void Editor::transformGroup(int index, const std::vector<Model>& before) {
         pose.position = target.position + rotate(pose.position - initial.position) * ratio;
         for (Vec3& direction : pose.basis) direction = rotate(direction);
         if (scale)
-            for (double& size : pose.size) size = std::clamp(size * ratio, .05, 100.0);
+            for (double& size : pose.size) size = std::clamp(size * ratio, minObjectScale, maxObjectScale);
         return pose;
     };
     for (int i : descendants) {
-        const bool scale = isGeometry(before[i].kind) || before[i].kind == ObjectKind::Group;
+        const bool scale = isGeometry(before[i].kind) || isFog(before[i].kind) || before[i].kind == ObjectKind::Group;
         models[i].transform = apply(before[i].transform, scale);
         for (std::size_t key = 0; key < models[i].keys.size(); ++key)
             models[i].keys[key].pose = apply(before[i].keys[key].pose, scale);
@@ -4502,6 +5452,7 @@ void Editor::cancelDrag() {
         break;
     case DragKind::Extrude:
     case DragKind::Component:
+    case DragKind::Marquee:
         break;
     }
     endDrag();
@@ -4509,9 +5460,19 @@ void Editor::cancelDrag() {
 
 void Editor::endDrag(bool commitComponent) {
     const bool editorDrag = drag.view >= 0 || adjustingTransparency || scrubbingTimeline;
-    if (!commitComponent && drag.view >= 0 && drag.kind == DragKind::Component && meshEdit) {
-        for (std::size_t i = 0; i < meshEdit->count; ++i)
-            meshEdit->draft.mesh.vertices[meshEdit->indices[i]] = meshEdit->original[i];
+    if (drag.view >= 0 && drag.kind == DragKind::Component && meshEdit) {
+        auto& edit = *meshEdit;
+        MeshEditChange change{};
+        for (std::size_t i = 0; i < edit.vertices.size(); ++i) {
+            const auto index = edit.vertices[i];
+            auto& position = edit.draft.mesh.vertices[index];
+            if (!commitComponent) position = edit.original[i];
+            else {
+                const Vec3 delta = position - edit.original[i];
+                if (dot(delta, delta) > 1e-16) change.positions.emplace_back(index, edit.original[i]);
+            }
+        }
+        if (!change.positions.empty()) recordMeshChange(std::move(change));
     }
     finishExtrusion(false);
     drag.view = -1;
@@ -4563,7 +5524,7 @@ void Editor::wheel(Vec2 p, double steps) {
     const int index = viewAt(p);
     if (index < 0 || flyout != Flyout::None) return;
     View& view = views[index];
-    view.zoom = std::clamp(view.zoom * std::pow(1.16, steps), minViewZoom, 8.0);
+    view.zoom = std::clamp(view.zoom * std::pow(1.16, steps), minViewZoom, maxViewZoom);
 }
 
 LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -4620,7 +5581,8 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_ERASEBKGND:
         return 1;
     case WM_LBUTTONDOWN:
-        mouseDown(point(), (GetKeyState(VK_MENU) & 0x8000) != 0, (wParam & MK_CONTROL) != 0);
+        mouseDown(point(), (GetKeyState(VK_MENU) & 0x8000) != 0,
+                  (wParam & MK_CONTROL) != 0, (wParam & MK_SHIFT) != 0);
         repaint();
         return 0;
     case WM_MBUTTONDOWN:
@@ -4655,6 +5617,11 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             commitInteraction();
             endDrag();
             repaint();
+        } else if (drag.view >= 0 && drag.kind == DragKind::Marquee) {
+            mouseMove(point());
+            finishMarquee();
+            endDrag();
+            repaint();
         } else if (drag.view >= 0 && drag.kind != DragKind::Pan) {
             mouseMove(point());
             finishExtrusion(true);
@@ -4679,6 +5646,7 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     case WM_CONTEXTMENU: {
         if (meshEdit) return 0;
+        resetDynamics();
         stopPlayback();
         POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         if (screen.x == -1 && screen.y == -1) {
@@ -4706,8 +5674,10 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_INITMENUPOPUP: {
         const HMENU menu = reinterpret_cast<HMENU>(wParam);
         if (menu == GetSubMenu(GetMenu(window), 1)) {
-            EnableMenuItem(menu, undoCommand, MF_BYCOMMAND | (undoHistory.empty() ? MF_GRAYED : MF_ENABLED));
-            EnableMenuItem(menu, redoCommand, MF_BYCOMMAND | (redoHistory.empty() ? MF_GRAYED : MF_ENABLED));
+            const bool canUndo = meshEdit ? !meshEdit->undoHistory.empty() : !undoHistory.empty();
+            const bool canRedo = meshEdit ? !meshEdit->redoHistory.empty() : !redoHistory.empty();
+            EnableMenuItem(menu, undoCommand, MF_BYCOMMAND | (canUndo ? MF_ENABLED : MF_GRAYED));
+            EnableMenuItem(menu, redoCommand, MF_BYCOMMAND | (canRedo ? MF_ENABLED : MF_GRAYED));
             for (UINT command : {renameCommand, duplicateCommand, deleteCommand, inspectCommand, visibilityCommand, frameCommand}) {
                 EnableMenuItem(menu, command, MF_BYCOMMAND | (selected < 0 ? MF_GRAYED : MF_ENABLED));
             }
@@ -4723,11 +5693,18 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     }
     case WM_COMMAND:
+        if (LOWORD(wParam) != renderCommand) resetDynamics();
         if (LOWORD(wParam) == materialWindowCommand) { showMaterials(); return 0; }
+        if (LOWORD(wParam) == undoCommand || LOWORD(wParam) == redoCommand) {
+            undo(LOWORD(wParam) == redoCommand);
+            return 0;
+        }
+        if (LOWORD(wParam) == selectCommand) { setTool(Tool::Select); return 0; }
         if (meshEdit) {
             if (LOWORD(wParam) == moveCommand) setTool(Tool::Move);
             if (LOWORD(wParam) == scaleCommand) setTool(Tool::Scale);
             if (LOWORD(wParam) == rotateCommand) setTool(Tool::Rotate);
+            if (LOWORD(wParam) == extrudeCommand) setTool(Tool::Extrude);
             return 0;
         }
         stopPlayback();
@@ -4743,8 +5720,6 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         case saveAsCommand: saveScene(true); return 0;
         case importObjCommand: importModels(); return 0;
         case exportObjCommand: exportModels(); return 0;
-        case undoCommand: undo(false); return 0;
-        case redoCommand: undo(true); return 0;
         case duplicateCommand: duplicate(); return 0;
         case deleteCommand: deleteSelection(); return 0;
         case renameCommand: rename(); return 0;
@@ -4813,6 +5788,7 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == renderTimer) { pollRender(); return 0; }
         if (wParam == timelineTimer) { tickPlayback(); return 0; }
+        if (wParam == dynamicsTimer) { tickDynamics(); return 0; }
         break;
     case cancelRenderMessage:
         stopRender();
@@ -4833,7 +5809,25 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (wParam == VK_ESCAPE) finishWindowResize();
             return 0;
         }
+        if (dynamics && wParam == VK_ESCAPE) {
+            resetDynamics();
+            return 0;
+        }
+        if (dynamics && wParam == VK_SPACE) {
+            if (!(lParam & (1L << 30))) toggleDynamics();
+            return 0;
+        }
+        if ((wParam == 'Z' || wParam == 'Y') && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (!(lParam & (1L << 30)))
+                undo(wParam == 'Y' || (GetKeyState(VK_SHIFT) & 0x8000));
+            return 0;
+        }
         if (meshEdit) {
+            if (wParam == VK_ESCAPE && drag.view >= 0) {
+                cancelDrag();
+                repaint();
+                return 0;
+            }
             if (wParam == VK_RETURN || wParam == VK_ESCAPE) finishMeshEdit(wParam == VK_RETURN);
             return 0;
         }
@@ -4850,8 +5844,6 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
                 case 'N': command = newSceneCommand; break;
                 case 'O': command = openSceneCommand; break;
                 case 'S': command = shift ? saveAsCommand : saveSceneCommand; break;
-                case 'Z': command = shift ? redoCommand : undoCommand; break;
-                case 'Y': command = redoCommand; break;
                 case 'D': command = duplicateCommand; break;
                 }
             } else {
@@ -4906,6 +5898,7 @@ LRESULT Editor::onMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         repaint();
         return 0;
     case WM_CLOSE:
+        resetDynamics();
         stopPlayback();
         finishWindowResize();
         if (meshEdit) finishMeshEdit(false);
@@ -4998,6 +5991,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR args, int show) {
     AppendMenuW(edit, MF_STRING, inspectCommand, L"&Transform...");
     AppendMenuW(edit, MF_STRING, frameCommand, L"&Frame Selection\tF");
     AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, selectCommand, L"&Select");
     AppendMenuW(edit, MF_STRING, moveCommand, L"&Move");
     AppendMenuW(edit, MF_STRING, scaleCommand, L"&Scale");
     AppendMenuW(edit, MF_STRING, rotateCommand, L"&Rotate");

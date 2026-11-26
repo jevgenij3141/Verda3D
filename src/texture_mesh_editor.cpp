@@ -5,10 +5,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <new>
 #include <numeric>
 
 namespace {
-constexpr int textureId = 100, firstToolId = 110, fitId = 114, restoreId = 120, unfoldId = 121;
+constexpr int textureId = 100, firstToolId = 110, fitId = 114, restoreId = 120, unfoldId = 121, smartUnfoldId = 122;
 constexpr int canvasTop = 77, footer = 46;
 enum class Tool { Move, ScaleX, ScaleY, Rotate };
 constexpr const wchar_t* toolNames[] = {L"Move", L"Scale X", L"Scale Y", L"Rotate"};
@@ -53,6 +54,7 @@ HWND addControl(HWND window, const wchar_t* type, const wchar_t* text, DWORD sty
 
 struct UvWindow {
     const Mesh& mesh;
+    const Transform& transform;
     const TextureUvs& defaults;
     const std::vector<TextureChoice>& textures;
     TextureUvs uvs, dragStart;
@@ -67,9 +69,9 @@ struct UvWindow {
     double zoom = 1;
     bool paintingDirty = true, dragging = false, panning = false, accepted = false, finished = false;
 
-    UvWindow(const Mesh& mesh, const TextureUvs& defaults, bool startWithDefaults,
+    UvWindow(const Mesh& mesh, const Transform& transform, const TextureUvs& defaults, bool startWithDefaults,
              const std::vector<TextureChoice>& textures, int material)
-        : mesh(mesh), defaults(defaults), textures(textures), selected(mesh.faces.size()) {
+        : mesh(mesh), transform(transform), defaults(defaults), textures(textures), selected(mesh.faces.size()) {
         if (startWithDefaults) uvs = defaults;
         else {
             uvs.reserve(mesh.faces.size());
@@ -96,6 +98,7 @@ struct UvWindow {
                        13 + i * 78, 46, 74, 23, firstToolId+i);
         CheckRadioButton(window, firstToolId, firstToolId+3, firstToolId);
         addControl(window, L"BUTTON", L"Fit UVs", WS_TABSTOP, 338, 43, 93, 27, fitId);
+        addControl(window, L"BUTTON", L"Smart Unfold", WS_TABSTOP, 438, 43, 93, 27, smartUnfoldId);
         addControl(window, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 0, 78, 27, IDOK);
         addControl(window, L"BUTTON", L"Cancel", WS_TABSTOP, 0, 0, 78, 27, IDCANCEL);
     }
@@ -297,6 +300,13 @@ LRESULT CALLBACK uvProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
         } else if (id == unfoldId) {
             state->uvs = unfoldTextureUvs(state->mesh);
             state->fit();
+        } else if (id == smartUnfoldId) {
+            try {
+                state->uvs = smartUnfoldTextureUvs(state->mesh, state->transform);
+                state->fit();
+            } catch (const std::bad_alloc&) {
+                MessageBoxW(window, L"Could not allocate memory for the UV layout.", L"Smart Unfold", MB_OK | MB_ICONERROR);
+            }
         } else if (id == fitId) state->fit();
         else if (id == textureId && HIWORD(wParam) == CBN_SELCHANGE) {
             const auto choice = SendDlgItemMessageW(window,textureId,CB_GETCURSEL,0,0);
@@ -436,7 +446,8 @@ TextureUvs unfoldTextureUvs(const Mesh& mesh) {
     return result;
 }
 
-bool editTextureMesh(HWND owner, const Mesh& mesh, const TextureUvs& defaults, bool startWithDefaults,
+bool editTextureMesh(HWND owner, const Mesh& mesh, const Transform& transform,
+                     const TextureUvs& defaults, bool startWithDefaults,
                      const std::vector<TextureChoice>& textures, int& material, TextureUvs& result) {
     if (mesh.faces.empty() || defaults.size() != mesh.faces.size() || textures.empty()) return false;
     constexpr wchar_t className[] = L"3D1TextureMeshEditor";
@@ -446,10 +457,11 @@ bool editTextureMesh(HWND owner, const Mesh& mesh, const TextureUvs& defaults, b
     wc.hCursor = LoadCursor(nullptr,IDC_ARROW);
     wc.lpszClassName = className;
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-    UvWindow state(mesh,defaults,startWithDefaults,textures,material);
+    UvWindow state(mesh,transform,defaults,startWithDefaults,textures,material);
     HMENU menu = CreateMenu(), edit = CreatePopupMenu();
     AppendMenuW(edit,MF_STRING,restoreId,L"&Restore");
     AppendMenuW(edit,MF_STRING,unfoldId,L"&Unfold");
+    AppendMenuW(edit,MF_STRING,smartUnfoldId,L"&Smart Unfold");
     AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(edit),L"&Edit");
     RECT r{};
     GetWindowRect(owner,&r);

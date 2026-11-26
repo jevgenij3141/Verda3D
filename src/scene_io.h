@@ -21,6 +21,7 @@ struct SceneDocument {
     RenderSettings rendering;
     int activeView = 0, selected = -1;
     TimelineSettings timeline;
+    DynamicsSettings dynamics;
 };
 
 bool writeScene(const wchar_t* filename, SceneDocument& scene);

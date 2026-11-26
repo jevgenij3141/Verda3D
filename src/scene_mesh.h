@@ -29,6 +29,7 @@ struct Bounds {
 
 const Mesh& modelMesh(const Model& model, bool baseOnly = false);
 Mesh createPrimitive(ObjectKind kind);
+Mesh createExtraPrimitive(ObjectKind kind);
 Mesh createPlane(int segmentsX, int segmentsY);
 FaceGeometry faceGeometry(const Model& model, std::size_t face, bool baseOnly = false);
 Bounds modelBounds(const Model& model, bool baseOnly = false);

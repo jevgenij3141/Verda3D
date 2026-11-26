@@ -58,7 +58,7 @@ enum class GraphicsTarget { Window, Bitmap };
     X(wglGetCurrentDC) \
     X(wglGetProcAddress) \
     X(wglMakeCurrent) \
-    X(wglUseFontBitmapsW) 
+    X(wglUseFontBitmapsW)
 
 struct GraphicsApi {
 #define GRAPHICS_DECLARE(name) decltype(&::name) name = nullptr;

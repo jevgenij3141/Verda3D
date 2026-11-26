@@ -15,7 +15,8 @@ struct TextureImage {
     std::vector<unsigned char> pixels;
 };
 
-enum class MaterialPreset { None, Ocean, Glass, Ground, Brick, Ice, Wood, Steel, Concrete, Marble, Sand, Checker };
+enum class MaterialPreset { None, Ocean, Glass, Ground, Brick, Ice, Wood, Steel, Concrete, Marble, Sand, Checker,
+                            ClearWater, RiverWater, Ruby, Emerald, Sapphire, Amethyst, Amber };
 
 struct Optics {
     double transmission = 0;
@@ -32,6 +33,7 @@ struct MaterialEdit {
 };
 
 constexpr int maxTextureRepeat = 256;
+constexpr int maxTextureDimension = 1024;
 
 inline double repeatedTextureCoordinate(double coordinate, int repeat) {
     if (!std::isfinite(coordinate)) return 0;
@@ -53,6 +55,12 @@ inline Optics materialOptics(const MaterialEdit& material) {
     case MaterialPreset::Glass: return {.93, 1.50, 1};
     case MaterialPreset::Ice: return {.65, 1.31, 1};
     case MaterialPreset::Ocean: return {.35, 1.33, 1};
+    case MaterialPreset::ClearWater: return {.96, 1.333, 1.25};
+    case MaterialPreset::RiverWater: return {.84, 1.333, 1.1};
+    case MaterialPreset::Ruby: case MaterialPreset::Sapphire: return {.90, 1.77, 1.1};
+    case MaterialPreset::Emerald: return {.91, 1.58, 1.1};
+    case MaterialPreset::Amethyst: return {.92, 1.54, 1.1};
+    case MaterialPreset::Amber: return {.82, 1.55, 1.1};
     default: return {};
     }
 }

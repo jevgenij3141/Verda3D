@@ -69,6 +69,10 @@ void refreshModes(HWND dialog) {
 
 bool readNumber(HWND dialog, int id, double low, double high, double& value, bool integer = false);
 
+std::wstring formatRange(int minimum, int maximum) {
+    return std::to_wstring(minimum) + L" - " + std::to_wstring(maximum);
+}
+
 struct ResolutionPreset { const wchar_t* name; int width, height; };
 constexpr ResolutionPreset resolutions[] = {
     {L"640 x 480 (VGA)", 640, 480},
@@ -104,14 +108,14 @@ INT_PTR CALLBACK renderSetupProc(HWND dialog, UINT message, WPARAM wParam, LPARA
         const std::wstring text = std::to_wstring(settings->samples);
         add(dialog, L"EDIT", text.c_str(), ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
             178, 81, 110, 25, samplesId, WS_EX_CLIENTEDGE);
-        add(dialog, L"STATIC", L"1 - 65536", 0, 299, 86, 100, 22);
+        add(dialog, L"STATIC", formatRange(minRenderSamples, maxRenderSamples).c_str(), 0, 299, 86, 100, 22);
         add(dialog, L"BUTTON", L"Caustics", BS_AUTOCHECKBOX | WS_TABSTOP,
             17, 116, 145, 24, causticsId);
         CheckDlgButton(dialog, causticsId, settings->caustics ? BST_CHECKED : BST_UNCHECKED);
         add(dialog, L"STATIC", L"Caustic photons", 0, 44, 151, 130, 22);
         add(dialog, L"EDIT", std::to_wstring(settings->causticPhotons).c_str(),
             ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, 178, 146, 110, 25, photonsId, WS_EX_CLIENTEDGE);
-        add(dialog, L"STATIC", L"5000 - 500000", 0, 299, 151, 113, 22);
+        add(dialog, L"STATIC", formatRange(minCausticPhotons, maxCausticPhotons).c_str(), 0, 299, 151, 113, 22);
         add(dialog, L"STATIC", L"Resolution", 0, 17, 204, 112, 22);
         const HWND presets = add(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
                                  136, 199, 260, 160, resolutionId);
@@ -156,7 +160,7 @@ INT_PTR CALLBACK renderSetupProc(HWND dialog, UINT message, WPARAM wParam, LPARA
         double samples = settings.samples;
         double photons = settings.causticPhotons;
         double width, height;
-        if (global && !readNumber(dialog, samplesId, 1, maxRenderSamples, samples, true)) return TRUE;
+        if (global && !readNumber(dialog, samplesId, minRenderSamples, maxRenderSamples, samples, true)) return TRUE;
         if (caustics && !readNumber(dialog, photonsId, minCausticPhotons, maxCausticPhotons, photons, true)) return TRUE;
         if (!readNumber(dialog, renderWidthId, minRenderDimension, maxRenderDimension, width, true) ||
             !readNumber(dialog, renderHeightId, minRenderDimension, maxRenderDimension, height, true)) return TRUE;
@@ -362,7 +366,8 @@ INT_PTR CALLBACK transformProc(HWND dialog, UINT message, WPARAM wParam, LPARAM 
         const double values[][3] = {{transform.position.x, transform.position.y, transform.position.z},
             {rx * 180 / pi, ry * 180 / pi, rz * 180 / pi},
             {transform.size[0], transform.size[1], transform.size[2]}};
-        const int rows = isGeometry(draft.kind) ? 3 : draft.kind == ObjectKind::Omni ? 1 : 2;
+        const int rows = isGeometry(draft.kind) || isFog(draft.kind) || isEmitter(draft.kind) ?
+                         3 : draft.kind == ObjectKind::Omni ? 1 : 2;
         layout(dialog, L"Object Transform", 413, 93 + rows * 36);
         const wchar_t* headers[] = {L"X", L"Y", L"Z"};
         const wchar_t* labels[] = {L"Position", L"Rotation (deg)", L"Scale"};
@@ -381,12 +386,13 @@ INT_PTR CALLBACK transformProc(HWND dialog, UINT message, WPARAM wParam, LPARAM 
     }
     if (message == WM_COMMAND && LOWORD(wParam) == IDOK) {
         auto& draft = *reinterpret_cast<TransformDraft*>(GetWindowLongPtrW(dialog, DWLP_USER));
-        const int rows = isGeometry(draft.kind) ? 3 : draft.kind == ObjectKind::Omni ? 1 : 2;
+        const int rows = isGeometry(draft.kind) || isFog(draft.kind) || isEmitter(draft.kind) ?
+                         3 : draft.kind == ObjectKind::Omni ? 1 : 2;
         double values[3][3]{};
         for (int row = 0; row < rows; ++row) {
             for (int column = 0; column < 3; ++column) {
-                const double low = row == 0 ? -100000 : row == 1 ? -3600 : .05;
-                const double high = row == 0 ? 100000 : row == 1 ? 3600 : 100;
+                const double low = row == 0 ? -100000 : row == 1 ? -3600 : minObjectScale;
+                const double high = row == 0 ? 100000 : row == 1 ? 3600 : maxObjectScale;
                 if (!readNumber(dialog, transformId + row * 3 + column, low, high, values[row][column])) return TRUE;
             }
         }
@@ -459,6 +465,106 @@ INT_PTR CALLBACK lightSetupProc(HWND dialog, UINT message, WPARAM wParam, LPARAM
     }
     return FALSE;
 }
+
+struct CollisionDraft {
+    CollisionSettings* body;
+    DynamicsSettings& dynamics;
+};
+
+INT_PTR CALLBACK collisionProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    enum Control { role = 200, mass, bounce, friction, velocityX, velocityY, velocityZ, gravity, ground, groundHeight };
+    if (message == WM_INITDIALOG) SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+    auto* draft = reinterpret_cast<CollisionDraft*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (!draft) return FALSE;
+    auto* body = draft->body;
+    auto& dynamics = draft->dynamics;
+    constexpr int spacing = 31, firstBodyField = 53;
+    const int worldTop = body ? 250 : 17;
+    if (message == WM_INITDIALOG) {
+        layout(dialog, L"Collision Settings", 358, worldTop + 148);
+        if (body) {
+            add(dialog, L"STATIC", L"Collision role", 0, 17, 21, 150, 22);
+            const HWND list = add(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                                  202, 17, 138, 130, role);
+            for (const auto* item : {L"Automatic", L"Dynamic", L"Static", L"Ignore"})
+                SendMessageW(list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+            SendMessageW(list, CB_SETCURSEL, WPARAM(body->role), 0);
+            number(dialog, L"Mass", mass, firstBodyField, body->mass);
+            number(dialog, L"Bounce (0 to 1)", bounce, firstBodyField + spacing, body->bounce);
+            number(dialog, L"Friction (0 to 1)", friction, firstBodyField + spacing * 2, body->friction);
+            number(dialog, L"Initial velocity X", velocityX, firstBodyField + spacing * 3, body->velocity.x);
+            number(dialog, L"Initial velocity Y", velocityY, firstBodyField + spacing * 4, body->velocity.y);
+            number(dialog, L"Initial velocity Z", velocityZ, firstBodyField + spacing * 5, body->velocity.z);
+        }
+        number(dialog, L"Gravity", gravity, worldTop, dynamics.gravity);
+        add(dialog, L"BUTTON", L"Ground plane", BS_AUTOCHECKBOX | WS_TABSTOP, 17, worldTop + spacing, 170, 24, ground);
+        CheckDlgButton(dialog, ground, dynamics.ground ? BST_CHECKED : BST_UNCHECKED);
+        number(dialog, L"Ground height (Y)", groundHeight, worldTop + spacing * 2, dynamics.groundHeight);
+        EnableWindow(GetDlgItem(dialog, groundHeight), dynamics.ground);
+        return TRUE;
+    }
+    if (message != WM_COMMAND) return FALSE;
+    switch (LOWORD(wParam)) {
+    case ground:
+        EnableWindow(GetDlgItem(dialog, groundHeight), checked(dialog, ground));
+        return TRUE;
+    case IDOK:
+        if (body) {
+            const auto choice = SendDlgItemMessageW(dialog, role, CB_GETCURSEL, 0, 0);
+            if (choice == CB_ERR ||
+                !readNumber(dialog, mass, minBodyMass, maxBodyMass, body->mass) ||
+                !readNumber(dialog, bounce, 0, 1, body->bounce) ||
+                !readNumber(dialog, friction, 0, 1, body->friction) ||
+                !readNumber(dialog, velocityX, -maxBodyVelocity, maxBodyVelocity, body->velocity.x) ||
+                !readNumber(dialog, velocityY, -maxBodyVelocity, maxBodyVelocity, body->velocity.y) ||
+                !readNumber(dialog, velocityZ, -maxBodyVelocity, maxBodyVelocity, body->velocity.z)) return TRUE;
+            body->role = CollisionRole(choice);
+        }
+        dynamics.ground = checked(dialog, ground);
+        if (!readNumber(dialog, gravity, 0, maxDynamicsGravity, dynamics.gravity) ||
+            (dynamics.ground && !readNumber(dialog, groundHeight, -maxGroundHeight, maxGroundHeight,
+                                          dynamics.groundHeight))) return TRUE;
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    case IDCANCEL: EndDialog(dialog, IDCANCEL); return TRUE;
+    }
+    return FALSE;
+}
+
+INT_PTR CALLBACK emitterProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    enum Control { rate = 220, radius, speed, viscosity, lifetime, quality };
+    if (message == WM_INITDIALOG) SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+    auto* settings = reinterpret_cast<EmitterSettings*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (!settings) return FALSE;
+    if (message == WM_INITDIALOG) {
+        layout(dialog, L"Water Emitter", 358, 264);
+        number(dialog, L"Particles per second", rate, 15, settings->rate);
+        number(dialog, L"Particle radius", radius, 48, settings->radius);
+        number(dialog, L"Initial speed", speed, 81, settings->speed);
+        number(dialog, L"Viscosity (0 to 1)", viscosity, 114, settings->viscosity);
+        number(dialog, L"Lifetime (seconds)", lifetime, 147, settings->lifetime);
+        add(dialog, L"STATIC", L"Surface quality", 0, 17, 182, 160, 23);
+        const auto list = add(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 202, 177, 138, 104, quality);
+        for (const auto* option : {L"Fast", L"Balanced", L"High"})
+            SendMessageW(list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option));
+        SendMessageW(list, CB_SETCURSEL, WPARAM(settings->quality), 0);
+        return TRUE;
+    }
+    if (message != WM_COMMAND) return FALSE;
+    if (LOWORD(wParam) == IDCANCEL) { EndDialog(dialog, IDCANCEL); return TRUE; }
+    if (LOWORD(wParam) != IDOK) return FALSE;
+    double emissionRate = settings->rate;
+    const auto choice = SendDlgItemMessageW(dialog, quality, CB_GETCURSEL, 0, 0);
+    if (choice == CB_ERR || !readNumber(dialog, rate, minEmissionRate, maxEmissionRate, emissionRate, true) ||
+        !readNumber(dialog, radius, minParticleRadius, maxParticleRadius, settings->radius) ||
+        !readNumber(dialog, speed, 0, maxEmissionSpeed, settings->speed) ||
+        !readNumber(dialog, viscosity, 0, 1, settings->viscosity) ||
+        !readNumber(dialog, lifetime, 1, maxParticleLifetime, settings->lifetime)) return TRUE;
+    settings->rate = int(emissionRate);
+    settings->quality = FogQuality(choice);
+    EndDialog(dialog, IDOK);
+    return TRUE;
+}
 } // namespace
 
 bool setupRender(HWND owner, RenderSettings& settings) {
@@ -505,7 +611,8 @@ bool editLightColor(HWND owner, Color& color) {
 }
 
 bool editShadowSize(HWND owner, int& size) {
-    NumberDraft draft{L"Custom Shadow Bitmap", L"Pixels per side (16 - 1024)",
+    const auto label = L"Pixels per side (" + formatRange(minShadowSize, maxShadowSize) + L")";
+    NumberDraft draft{L"Custom Shadow Bitmap", label.c_str(),
                       double(size), minShadowSize, maxShadowSize, true};
     if (runDialog(owner, numberProc, reinterpret_cast<LPARAM>(&draft)) != IDOK) return false;
     size = int(draft.current);
@@ -531,3 +638,12 @@ bool editWholeNumber(HWND owner, const wchar_t* title, const wchar_t* label, int
 }
 
 bool chooseSmoothModifier(HWND owner) { return runDialog(owner, modifierPickerProc, 0) == IDOK; }
+
+bool editCollision(HWND owner, CollisionSettings* body, DynamicsSettings& dynamics) {
+    CollisionDraft draft{body, dynamics};
+    return runDialog(owner, collisionProc, reinterpret_cast<LPARAM>(&draft)) == IDOK;
+}
+
+bool editWaterEmitter(HWND owner, EmitterSettings& settings) {
+    return runDialog(owner, emitterProc, reinterpret_cast<LPARAM>(&settings)) == IDOK;
+}

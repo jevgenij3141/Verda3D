@@ -1,4 +1,5 @@
 #include "material_library.h"
+#include "scene_mesh.h"
 
 #include <algorithm>
 #include <array>
@@ -6,7 +7,9 @@
 
 namespace {
 constexpr const wchar_t* names[] = {L"Ocean", L"Glass", L"Ground", L"Brick", L"Ice", L"Wood",
-                                    L"Steel", L"Concrete", L"Marble", L"Sand", L"Checker"};
+                                    L"Steel", L"Concrete", L"Marble", L"Sand", L"Checker",
+                                    L"Clear Water", L"River Water", L"Ruby", L"Emerald", L"Sapphire", L"Amethyst", L"Amber"};
+static_assert(std::size(names) == presetCount);
 
 double hash(int x, int y) {
     auto value = std::uint32_t(x) * 374761393u + std::uint32_t(y) * 668265263u;
@@ -70,11 +73,32 @@ Color pattern(MaterialPreset preset, double u, double v) {
 }
 
 constexpr int presetList = 110;
-INT_PTR CALLBACK libraryProc(HWND dialog, UINT message, WPARAM wParam, LPARAM) {
+INT_PTR CALLBACK libraryProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_MEASUREITEM && wParam == presetList) {
+        reinterpret_cast<MEASUREITEMSTRUCT*>(lParam)->itemHeight = 31;
+        return TRUE;
+    }
+    if (message == WM_DRAWITEM && wParam == presetList) {
+        const auto& item = *reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (item.itemID >= presetCount) return TRUE;
+        const bool selected = (item.itemState & ODS_SELECTED) != 0;
+        FillRect(item.hDC, &item.rcItem, GetSysColorBrush(selected ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+        const auto preset = MaterialPreset(item.itemID + 1);
+        const auto rect = item.rcItem;
+        if (isCrystalPreset(preset))
+            drawCrystalPreview(item.hDC, {rect.left + 3, rect.top + 1, rect.left + 33, rect.bottom - 1}, makePreset(preset));
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+        RECT title{rect.left + 38, rect.top, rect.right, rect.bottom};
+        DrawTextW(item.hDC, presetName(preset), -1, &title, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (item.itemState & ODS_FOCUS) DrawFocusRect(item.hDC, &item.rcItem);
+        return TRUE;
+    }
     if (message == WM_INITDIALOG) {
         SetWindowTextW(dialog, L"Material Library");
         const HWND list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
+            LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             13, 13, 238, 127, dialog, reinterpret_cast<HMENU>(presetList), GetModuleHandleW(nullptr), nullptr);
         SendMessageW(list, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), FALSE);
         for (const auto* name : names) SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
@@ -99,14 +123,24 @@ const wchar_t* presetName(MaterialPreset preset) {
 }
 
 Vec3 shadeNormal(MaterialPreset preset, Vec3 normal, Vec3 point) {
-    if (preset != MaterialPreset::Ocean && preset != MaterialPreset::Ice) return normal;
+    if (!usesSurfaceRipples(preset)) return normal;
     const Vec3 tangent = normalized(cross(std::abs(normal.y) > .94 ? Vec3{0, 0, 1} : Vec3{0, 1, 0}, normal));
     const Vec3 bitangent = cross(normal, tangent);
     const double x = dot(point, tangent), y = dot(point, bitangent);
-    const double strength = preset == MaterialPreset::Ocean ? .15 : .07;
+    const double strength = preset == MaterialPreset::Ocean ? .15 : preset == MaterialPreset::ClearWater ? .018 :
+                            preset == MaterialPreset::RiverWater ? .095 : .07;
     const double u = std::sin(x * 14 + y * 3 + 1.4 * std::sin(y * 9));
     const double v = std::sin(y * 18 - x * 6) * .75;
     return normalized(normal + tangent * (strength * u) + bitangent * (strength * v));
+}
+
+bool usesSurfaceRipples(MaterialPreset preset) {
+    return preset == MaterialPreset::Ocean || preset == MaterialPreset::Ice ||
+           preset == MaterialPreset::ClearWater || preset == MaterialPreset::RiverWater;
+}
+
+bool isCrystalPreset(MaterialPreset preset) {
+    return preset >= MaterialPreset::Ruby && preset <= MaterialPreset::Amber;
 }
 
 MaterialEdit makePreset(MaterialPreset preset) {
@@ -120,7 +154,21 @@ MaterialEdit makePreset(MaterialPreset preset) {
     case MaterialPreset::Steel: surface.diffuse = 58; surface.specular = 95; surface.shininess = 105; break;
     case MaterialPreset::Marble: surface.diffuse = 72; surface.specular = 55; surface.shininess = 55; break;
     case MaterialPreset::Wood: surface.specular = 22; surface.shininess = 24; break;
+    case MaterialPreset::ClearWater: surface.tint = {.94f, .99f, 1}; break;
+    case MaterialPreset::RiverWater: surface.tint = {.66f, .89f, .92f}; break;
+    case MaterialPreset::Ruby: surface.tint = {.90f, .08f, .18f}; break;
+    case MaterialPreset::Emerald: surface.tint = {.075f, .78f, .33f}; break;
+    case MaterialPreset::Sapphire: surface.tint = {.12f, .31f, .95f}; break;
+    case MaterialPreset::Amethyst: surface.tint = {.61f, .30f, .91f}; break;
+    case MaterialPreset::Amber: surface.tint = {.99f, .58f, .14f}; break;
     default: surface.shading = Shading::Lambert; surface.specular = 0; break;
+    }
+    if (isCrystalPreset(preset) || preset == MaterialPreset::ClearWater || preset == MaterialPreset::RiverWater) {
+        surface.shading = Shading::BlinnPhong;
+        surface.diffuse = 20;
+        surface.specular = 100;
+        surface.shininess = preset == MaterialPreset::RiverWater ? 72 : 125;
+        return material;
     }
     if (preset == MaterialPreset::Glass || preset == MaterialPreset::None) return material;
     auto& image = material.image;
@@ -138,6 +186,56 @@ MaterialEdit makePreset(MaterialPreset preset) {
         }
     }
     return material;
+}
+
+std::vector<CrystalFacet> crystalPreview(const MaterialEdit& material) {
+    constexpr std::array cuts{ObjectKind::CrystalBrilliant, ObjectKind::CrystalStep, ObjectKind::CrystalOctahedron,
+                              ObjectKind::CrystalPoint, ObjectKind::CrystalBrilliant};
+    if (!isCrystalPreset(material.preset)) return {};
+    const auto mesh = createExtraPrimitive(cuts[std::size_t(material.preset) - std::size_t(MaterialPreset::Ruby)]);
+    const Vec3 view = normalized({.37,.42,1});
+    const Vec3 right = normalized(cross(axes[1], view)), up = cross(view, right);
+    const Vec3 key = normalized({-.48,.83,.65});
+    const auto half = normalized(view + key);
+    std::vector<CrystalFacet> result;
+    for (const auto& face : mesh.faces) {
+        const auto point = mesh.vertices[face.vertices[0]];
+        const auto normal = normalized(cross(mesh.vertices[face.vertices[1]] - point,
+                                            mesh.vertices[face.vertices[2]] - point));
+        if (dot(normal, view) <= 0) continue;
+        CrystalFacet facet{};
+        facet.count = face.count;
+        for (std::size_t i = 0; i < face.count; ++i) {
+            const auto p = mesh.vertices[face.vertices[i]];
+            facet.corners[i] = {dot(p, right), -dot(p, up)};
+        }
+        const double highlight = std::pow(std::max(0.0, dot(half,normal)), 8) * .82;
+        const double illumination = .35 + .65 * std::max(0.0, dot(normal,key));
+        const auto tint = material.surface.tint;
+        facet.color = mix({float(tint.r * illumination), float(tint.g * illumination),
+                           float(tint.b * illumination)}, {.94f,.97f,1}, highlight);
+        result.push_back(facet);
+    }
+    return result;
+}
+
+void drawCrystalPreview(HDC dc, RECT area, const MaterialEdit& material) {
+    const double size = .94 * std::min(area.right - area.left, area.bottom - area.top);
+    const Vec2 center{(area.left + area.right) * .5, (area.top + area.bottom) * .5};
+    const auto saved = SaveDC(dc);
+    SelectObject(dc, GetStockObject(NULL_PEN));
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    for (const auto& facet : crystalPreview(material)) {
+        std::array<POINT, 4> points{};
+        for (std::size_t i = 0; i < facet.count; ++i) {
+            const auto p = center + facet.corners[i] * size;
+            points[i] = {LONG(std::round(p.x)), LONG(std::round(p.y))};
+        }
+        const auto c = facet.color;
+        SetDCBrushColor(dc, RGB(int(c.r * 255), int(c.g * 255), int(c.b * 255)));
+        Polygon(dc, points.data(), int(facet.count));
+    }
+    RestoreDC(dc, saved);
 }
 
 MaterialPreset chooseMaterialPreset(HWND owner) {

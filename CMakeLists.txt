@@ -1,16 +1,27 @@
-cmake_minimum_required(VERSION 3.16)
-project(ThreeD1Editor LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(ThreeD1Editor VERSION 0.4.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "3D1 Editor uses Win32 to open its window.")
 endif()
+enable_language(RC)
+configure_file(src/startup_art.rc.in startup_art.rc @ONLY)
 
 add_executable(3D1Editor WIN32 src/main.cpp src/material_editor.cpp src/global_renderer.cpp
     src/lighting_dialog.cpp src/shadow_map.cpp src/scene_mesh.cpp src/material_library.cpp src/scene_io.cpp
     src/obj_io.cpp src/image_output.cpp src/animation.cpp src/mesh_modifiers.cpp src/mesh_cut.cpp
-    src/video_export.cpp src/video_dialog.cpp src/texture_mesh_editor.cpp src/graphics_api.cpp src/startup_splash.cpp)
-target_compile_features(3D1Editor PRIVATE cxx_std_17)
-target_compile_definitions(3D1Editor PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    src/video_export.cpp src/video_dialog.cpp src/texture_mesh_editor.cpp src/smart_unfold.cpp
+    src/graphics_api.cpp src/startup_splash.cpp src/dynamics.cpp src/fluid.cpp src/extra_primitives.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/startup_art.rc")
+set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/startup_art.rc" APPEND PROPERTY
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/startup-art.png")
+set_target_properties(3D1Editor PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_compile_definitions(3D1Editor PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX VERDA_VERSION="${PROJECT_VERSION}")
+if(MSVC)
+    target_compile_options(3D1Editor PRIVATE /W4 /permissive-)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(3D1Editor PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 target_link_libraries(3D1Editor PRIVATE gdi32 user32 comdlg32 comctl32 ole32 windowscodecs uuid
     mfplat mfreadwrite mfuuid)
 

@@ -50,6 +50,7 @@ const Mesh& modelMesh(const Model& model, bool baseOnly) {
 }
 
 Mesh createPrimitive(ObjectKind kind) {
+    if (kind >= ObjectKind::Teapot) return createExtraPrimitive(kind);
     Mesh mesh;
     constexpr std::array<Vec2, 4> quadUv{{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
     const auto tri = [&](std::size_t a, std::size_t b, std::size_t c, Vec2 u, Vec2 v, Vec2 w) {
@@ -187,8 +188,7 @@ Bounds modelBounds(const Model& model, bool baseOnly) {
 }
 
 bool prepareExtrusion(Mesh& mesh, const std::vector<std::size_t>& faces, ExtrusionTopology& topology) {
-    constexpr std::size_t meshLimit = 100000;
-    if (faces.empty() || mesh.vertices.size() > meshLimit || mesh.faces.size() > meshLimit) return false;
+    if (faces.empty() || mesh.vertices.size() > maxMeshVertices || mesh.faces.size() > maxMeshFaces) return false;
     const auto key = [](std::size_t a, std::size_t b) { return (std::uint64_t(a) << 32) | b; };
     const auto edgeKey = [&](std::size_t a, std::size_t b) { return key(std::min(a,b), std::max(a,b)); };
     struct Edge {
@@ -247,7 +247,7 @@ bool prepareExtrusion(Mesh& mesh, const std::vector<std::size_t>& faces, Extrusi
         }
         ++addedFaces;
     }
-    if (mesh.faces.size() + addedFaces > meshLimit) return false;
+    if (mesh.faces.size() + addedFaces > maxMeshFaces) return false;
 
     std::unordered_map<std::uint64_t, std::size_t> capVertices;
     auto& moved = topology.moved;
@@ -292,7 +292,7 @@ bool prepareExtrusion(Mesh& mesh, const std::vector<std::size_t>& faces, Extrusi
         remap[i] = count;
         mesh.vertices[count++] = mesh.vertices[i];
     }
-    if (count > meshLimit) return false;
+    if (count > maxMeshVertices) return false;
     mesh.vertices.resize(count);
     mesh.normals.clear();
     for (auto& face : mesh.faces)
@@ -370,7 +370,7 @@ bool bridgeFaces(Mesh& mesh, const Transform& transform, std::size_t first, std:
         else if (j == nextJ) sides.push_back({{x,nextX,y,y},{uvX,uvNextX,uvY,uvY},3});
         else sides.push_back({{x,nextX,nextY,y},{uvX,uvNextX,uvNextY,uvY}});
     });
-    if (mesh.faces.size() - 2 + sides.size() > 100000) return false;
+    if (mesh.faces.size() - 2 + sides.size() > maxMeshFaces) return false;
     for (const auto& face : mesh.faces) {
         for (std::size_t j = 0; j < face.count; ++j) {
             const auto x = face.vertices[j], y = face.vertices[(j+1) % face.count];

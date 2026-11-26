@@ -1,4 +1,5 @@
 #include "material_editor.h"
+#include "material_library.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -20,7 +21,7 @@ using ComPtr = std::unique_ptr<T, ComRelease>;
 
 int textureSize(UINT source) {
     int size = 1;
-    while (size < 1024 && static_cast<UINT>(size) < source) size *= 2;
+    while (size < maxTextureDimension && static_cast<UINT>(size) < source) size *= 2;
     return size;
 }
 
@@ -250,7 +251,12 @@ struct MaterialDialog {
         FillRect(dc, &swatchArea, swatch);
         DeleteObject(swatch);
         FrameRect(dc, &swatchArea, GetSysColorBrush(COLOR_3DSHADOW));
-        if (RectVisible(dc, &previewArea)) drawSphere(dc);
+        if (RectVisible(dc, &previewArea)) {
+            if (isCrystalPreset(edit.preset)) {
+                FillRect(dc, &previewArea, GetSysColorBrush(COLOR_3DSHADOW));
+                drawCrystalPreview(dc, previewArea, edit);
+            } else drawSphere(dc);
+        }
         EndPaint(window, &region);
     }
 

@@ -1,0 +1,2 @@
+#include "@CMAKE_CURRENT_SOURCE_DIR@/src/startup_assets.h"
+VERDA_STARTUP_ART RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/assets/startup-art.png"

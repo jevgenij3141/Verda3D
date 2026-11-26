@@ -8,7 +8,11 @@
 
 namespace {
 constexpr char magic[] = "3D1SCENE";
-constexpr unsigned version = 11;
+constexpr unsigned fogVersion = 12, fogShadowsVersion = 13, fogQualityVersion = 14;
+constexpr unsigned dynamicsVersion = 15;
+constexpr unsigned emitterVersion = 16;
+constexpr unsigned primitiveVersion = 17;
+constexpr unsigned version = primitiveVersion;
 constexpr std::uintmax_t maxFileBytes = 512ull * 1024 * 1024;
 
 template<bool reading> struct Archive {
@@ -65,7 +69,7 @@ template<bool reading> struct Archive {
     }
 
     bool mesh(Mesh& mesh, ObjectKind kind) {
-        if (!resize(mesh.vertices, 100000) || !resize(mesh.faces, 100000)) return false;
+        if (!resize(mesh.vertices, maxMeshVertices) || !resize(mesh.faces, maxMeshFaces)) return false;
         if (mesh.faces.empty() != mesh.vertices.empty()) return false;
         if ((!isGeometry(kind) && !mesh.faces.empty()) ||
             (isGeometry(kind) && kind != ObjectKind::Box && mesh.faces.empty())) return false;
@@ -97,13 +101,16 @@ template<bool reading> struct Archive {
         const auto& basis = transform.basis;
         if (dot(cross(basis[0], basis[1]), basis[2]) < .999) return false;
         for (auto& size : transform.size) {
-            if (!scalar(size) || size < .05 || size > 100) return false;
+            if (!scalar(size) || size < minObjectScale || size > maxObjectScale) return false;
         }
         return true;
     }
 
     bool model(Model& model) {
-        if (!enumeration(model.kind, fileVersion < 7 ? int(ObjectKind::Mesh) : int(ObjectKind::Group)) ||
+        const auto lastKind = fileVersion < 7 ? ObjectKind::Mesh : fileVersion < fogVersion ? ObjectKind::Group :
+                              fileVersion < emitterVersion ? ObjectKind::Fog :
+                              fileVersion < primitiveVersion ? ObjectKind::Emitter : ObjectKind::CrystalBrilliant;
+        if (!enumeration(model.kind, int(lastKind)) ||
             !blob(model.name, 128) || model.name.empty() ||
             !scalar(model.material) || !vector(model.transform.position)) return false;
         if (fileVersion >= 2 && !flag(model.hidden)) return false;
@@ -115,6 +122,35 @@ template<bool reading> struct Archive {
                 !scalar(l.cone) || l.cone < 1 || l.cone > 160 || !flag(l.enabled) || !flag(l.shadows) ||
                 !scalar(l.shadowSize) || l.shadowSize < minShadowSize || l.shadowSize > maxShadowSize ||
                 !scalar(l.shadowTransparency) || l.shadowTransparency < 0 || l.shadowTransparency > 1) return false;
+        }
+        if (isFog(model.kind)) {
+            auto& fog = model.fog;
+            if (!enumeration(fog.style, int(FogStyle::Cloud)) ||
+                !scalar(fog.density) || fog.density < minFogDensity || fog.density > maxFogDensity ||
+                !scalar(fog.detail) || fog.detail < minFogDetail || fog.detail > maxFogDetail ||
+                !scalar(fog.flow) || fog.flow < minFogFlow || fog.flow > maxFogFlow ||
+                !color(fog.color)) return false;
+            if (fileVersion >= fogShadowsVersion && !flag(fog.shadows)) return false;
+            if (fileVersion >= fogQualityVersion && !enumeration(fog.quality, int(FogQuality::High))) return false;
+        }
+        if (fileVersion >= dynamicsVersion && isGeometry(model.kind)) {
+            auto& body = model.collision;
+            if (!enumeration(body.role, int(CollisionRole::Ignore)) || !scalar(body.mass) ||
+                body.mass < minBodyMass || body.mass > maxBodyMass ||
+                !scalar(body.bounce) || body.bounce < 0 || body.bounce > 1 ||
+                !scalar(body.friction) || body.friction < 0 || body.friction > 1 ||
+                !vector(body.velocity) ||
+                std::max({std::abs(body.velocity.x), std::abs(body.velocity.y), std::abs(body.velocity.z)}) > maxBodyVelocity)
+                return false;
+        }
+        if (isEmitter(model.kind)) {
+            auto& e = model.emitter;
+            if (!scalar(e.rate) || e.rate < minEmissionRate || e.rate > maxEmissionRate ||
+                !scalar(e.radius) || e.radius < minParticleRadius || e.radius > maxParticleRadius ||
+                !scalar(e.speed) || e.speed < 0 || e.speed > maxEmissionSpeed ||
+                !scalar(e.viscosity) || e.viscosity < 0 || e.viscosity > 1 ||
+                !scalar(e.lifetime) || e.lifetime < 1 || e.lifetime > maxParticleLifetime ||
+                !enumeration(e.quality, int(FogQuality::High))) return false;
         }
         if (!mesh(model.mesh, model.kind)) return false;
         if (fileVersion < 3) return true;
@@ -142,7 +178,7 @@ template<bool reading> struct Archive {
             (!isGeometry(model.kind) && model.meshShading != MeshShading::Default)) return false;
         if (fileVersion < 11 || !isGeometry(model.kind)) return true;
         auto& defaults = model.defaultTextureUvs;
-        if (!resize(defaults, 100000) || (!defaults.empty() && defaults.size() != model.mesh.faces.size())) return false;
+        if (!resize(defaults, maxMeshFaces) || (!defaults.empty() && defaults.size() != model.mesh.faces.size())) return false;
         for (std::size_t i = 0; i < defaults.size(); ++i)
             for (std::size_t j = 0; j < model.mesh.faces[i].count; ++j)
                 if (!scalar(defaults[i][j].x) || !scalar(defaults[i][j].y)) return false;
@@ -159,7 +195,8 @@ template<bool reading> struct Archive {
         auto& image = edit.image;
         if (!scalar(s.shininess) || s.shininess < 1 || s.shininess > 128 ||
             !scalar(image.width) || !scalar(image.height) ||
-            image.width < 0 || image.width > 1024 || image.height < 0 || image.height > 1024 ||
+            image.width < 0 || image.width > maxTextureDimension ||
+            image.height < 0 || image.height > maxTextureDimension ||
             !blob(image.filename, 32768)) return false;
         const auto dataSize = std::size_t(image.width) * image.height * 4;
         if (!reading && image.pixels.size() != dataSize) return false;
@@ -184,7 +221,7 @@ template<bool reading> struct Archive {
         if constexpr (!reading) std::memcpy(token, magic, sizeof(magic));
         if (!bytes(token, sizeof(token)) || std::memcmp(token, magic, sizeof(token)) != 0 ||
             !scalar(fileVersion) || fileVersion < 1 || fileVersion > version ||
-            !resize(scene.models, 10000) || !resize(scene.materials, 256)) return false;
+            !resize(scene.models, maxSceneObjects) || !resize(scene.materials, 256)) return false;
         for (Model& item : scene.models) {
             if (!model(item) || item.material < -1 || item.material >= int(scene.materials.size()) ||
                 (!isGeometry(item.kind) && item.material != -1)) return false;
@@ -215,14 +252,15 @@ template<bool reading> struct Archive {
         for (SavedView& view : scene.views) {
             if (!vector(view.back) || !vector(view.right) || !vector(view.up) || !vector(view.target) ||
                 std::abs(dot(view.back, view.back) - 1) > .001 || std::abs(dot(view.right, view.right) - 1) > .001 ||
-                std::abs(dot(view.up, view.up) - 1) > .001 || !scalar(view.zoom) || view.zoom < minViewZoom || view.zoom > 8 ||
+                std::abs(dot(view.up, view.up) - 1) > .001 || !scalar(view.zoom) ||
+                view.zoom < minViewZoom || view.zoom > maxViewZoom ||
                 !scalar(view.perspective) || (view.perspective != 0 && view.perspective != 1) ||
                 !scalar(view.orbited) || (view.orbited != 0 && view.orbited != 1) ||
                 !scalar(view.camera) || view.camera < -1 || view.camera >= int(scene.models.size()) ||
                 (view.camera >= 0 && scene.models[view.camera].kind != ObjectKind::Camera)) return false;
         }
         const bool valid = enumeration(scene.rendering.mode, 1) && scalar(scene.rendering.samples) &&
-               scene.rendering.samples >= 1 && scene.rendering.samples <= maxRenderSamples &&
+               scene.rendering.samples >= minRenderSamples && scene.rendering.samples <= maxRenderSamples &&
                scalar(scene.activeView) && scene.activeView >= 0 && scene.activeView < int(scene.views.size()) &&
                scalar(scene.selected) && scene.selected >= -1 && scene.selected < int(scene.models.size());
         if (!valid || fileVersion < 3) return valid;
@@ -242,6 +280,12 @@ template<bool reading> struct Archive {
         if (fileVersion >= 9)
             for (auto& view : scene.views)
                 if (!enumeration(view.mode, int(ViewportMode::Software))) return false;
+        if (fileVersion >= dynamicsVersion) {
+            auto& dynamics = scene.dynamics;
+            return flag(dynamics.ground) && scalar(dynamics.gravity) && dynamics.gravity >= 0 &&
+                   dynamics.gravity <= maxDynamicsGravity && scalar(dynamics.groundHeight) &&
+                   std::abs(dynamics.groundHeight) <= maxGroundHeight;
+        }
         return true;
     }
 };

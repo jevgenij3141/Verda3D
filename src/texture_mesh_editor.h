@@ -12,7 +12,9 @@ struct TextureChoice {
 };
 
 TextureUvs unfoldTextureUvs(const Mesh& mesh);
+TextureUvs smartUnfoldTextureUvs(const Mesh& mesh, const Transform& transform);
 bool hasStackedTextureUvs(const Mesh& mesh, const TextureUvs* layout = nullptr);
 
-bool editTextureMesh(HWND owner, const Mesh& mesh, const TextureUvs& defaults, bool startWithDefaults,
+bool editTextureMesh(HWND owner, const Mesh& mesh, const Transform& transform,
+                     const TextureUvs& defaults, bool startWithDefaults,
                      const std::vector<TextureChoice>& textures, int& material, TextureUvs& result);
